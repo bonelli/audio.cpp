@@ -186,7 +186,7 @@ Value convert_cjson(const cJSON * node) {
                 throw std::runtime_error("json object key is missing");
             }
             if (out.find(child->string) != out.end()) {
-                throw std::runtime_error("duplicate json object key: " + std::string(child->string));
+                throw std::runtime_error("duplicate json object key");
             }
             out.emplace(child->string, convert_cjson(child));
         }

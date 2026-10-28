@@ -178,22 +178,69 @@ int main() {
             invalid_option.body.find("private-missing.wav") != std::string::npos ||
             invalid_option.body.find("SENSITIVE_BAD_BOOLEAN") != std::string::npos)
             throw std::runtime_error("serial handler leaked or accepted invalid encode-only option");
+        for (const auto & value : {"null", "123", "false", "{\"private\":\"SENSITIVE_BAD_VALUE\"}", "[\"SENSITIVE_BAD_VALUE\"]"}) {
+            for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
+                {"/v1/tasks/run", "{\"model\":\"task\",\"request\":{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}}"},
+                {"/v1/tasks/stream", "{\"model\":\"task\",\"request\":{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}}"},
+                {"/v1/tasks/batch", "{\"model\":\"task\",\"requests\":[{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}]}"},
+                {"/v1/audio/speech", "{\"model\":\"task\",\"input\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}"}}) {
+                const auto result = post(path, body);
+                if (result.status != 400 || result.body.find("options.system_prompt must be a string") == std::string::npos ||
+                    result.body.find("SENSITIVE_BAD_VALUE") != std::string::npos)
+                    throw std::runtime_error("serial system_prompt type rejection failed on " + path);
+            }
+        }
+        for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
+            {"/v1/tasks/run", R"({"model":"task","request":{"options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}}})"},
+            {"/v1/tasks/stream", R"({"model":"task","request":{"options":{"system_\u0070rompt":"SENSITIVE\u0000TRUNCATED"}}})"},
+            {"/v1/tasks/batch", R"({"model":"task","requests":[{"options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}}]})"},
+            {"/v1/audio/speech", R"({"model":"task","input":"hi","options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}})"}}) {
+            const auto result = post(path, body);
+            if (result.status != 400 || result.body.find("cannot contain NUL") == std::string::npos ||
+                result.body.find("SENSITIVE") != std::string::npos)
+                throw std::runtime_error("serial system_prompt NUL rejection failed on " + path);
+        }
+        for (const std::string path : {"/v1/tasks/run", "/v1/tasks/stream", "/v1/tasks/batch", "/v1/audio/speech"}) {
+            std::string error;
+            try {
+                const auto result = post(path, "{\"options\":{\"system_prompt\":\"SENSITIVE_DUP_KEY\",\"SENSITIVE_DUP_KEY\":1,\"SENSITIVE_DUP_KEY\":2}}");
+                if (result.status != 500) throw std::runtime_error("unexpected malformed JSON status");
+                error = result.body;
+            } catch (const std::runtime_error & ex) { error = ex.what(); }
+            if (error.find("duplicate json object key") == std::string::npos || error.find("SENSITIVE_DUP_KEY") != std::string::npos)
+                throw std::runtime_error("serial invalid JSON exposed private content on " + path);
+        }
         {
             const auto log = std::filesystem::temp_directory_path() / "audiocpp-serial-reference-logging-test.log";
             std::filesystem::remove(log);
             engine::debug::configure_logging({true, log.string()});
             for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
                  {"/v1/tasks/run", "{\"model\":\"task\",\"request\":{\"options\":{\"references\":\"SENSITIVE_VQ\"}}}"},
+                 {"/v1/tasks/run", "{\"model\":\"task\",\"request\":{\"options\":{\"system_prompt\":\"SENSITIVE_PROMPT\"}}}"},
+                 {"/v1/tasks/stream", "{\"model\":\"task\",\"request\":{\"options\":{\"system_\\u0070rompt\":\"SENSITIVE_ESCAPED_PROMPT\"}}}"},
+                 {"/v1/audio/speech", "{\"model\":\"task\",\"input\":\"hello\",\"options\":{\"system_prompt\":\"SENSITIVE_BROKEN_PROMPT\""},
+                 {"/not-a-route", "{\"options\":{\"system_prompt\":\"SENSITIVE_WRONG_ROUTE\"}}"},
+                 {"/not-a-route", "{\"options\":{\"system_\\u0070rompt\":\"SENSITIVE_WRONG_ESCAPED\"}}"},
+                 {"/not-a-route", "{\"system_\\u0070rompt\":\"SENSITIVE_WRONG_MALFORMED\""},
+                 {"/not-a-route", "{\"text\":\"ORDINARY_WRONG_ROUTE\"}"},
                  {"/v1/audio/speech", "{\"model\":\"task\",\"voice_\\u0072ef\":\"SENSITIVE_AUDIO\"}"},
                  {"/v1/tasks/run", "{\"artifacts\":\"SENSITIVE_ARTIFACT\""},
                  {"/v1/tasks/run", "{\"model\":\"task\",\"text\":\"ORDINARY_SERIAL\"}"}}) {
                 try { (void)post(path, body); } catch (const std::exception &) {}
             }
+            std::istream live_body(nullptr);
+            minitts::server::HttpRequest live_request;
+            live_request.method = "POST";
+            live_request.path = "/v1/audio/speech/live";
+            live_request.query = "system_prompt=SENSITIVE_QUERY&foo=bar";
+            live_request.body_stream = &live_body;
+            minitts::server::log_request_body_if_enabled(task_config, live_request);
             engine::debug::reset_logging();
             std::ifstream input(log);
             const std::string content{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
             std::filesystem::remove(log);
-            if (content.find("SENSITIVE_") != std::string::npos || content.find("ORDINARY_SERIAL") == std::string::npos)
+            if (content.find("SENSITIVE_") != std::string::npos || content.find("ORDINARY_SERIAL") == std::string::npos ||
+                content.find("ORDINARY_WRONG_ROUTE") == std::string::npos)
                 throw std::runtime_error("serial handler logged reference data or skipped an ordinary request");
         }
         for (const auto & [bad, message] : std::vector<std::pair<std::string, std::string>>{

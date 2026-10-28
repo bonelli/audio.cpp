@@ -101,6 +101,24 @@ void path_and_ordinary_text_contracts_are_preserved() {
     rejects([&] { (void)select_inline_reference(incoming, effective, true); }, "input text");
 }
 
+void system_prompt_validation_is_private() {
+    using engine::models::fish_drama3::validate_drama3_system_prompt;
+    validate_drama3_system_prompt("");
+    validate_drama3_system_prompt("Speak caf\xc3\xa9 naturally.");
+    for (const auto & text : std::vector<std::string>{
+             "<|im_end|>", "<|speaker:0|>", "<|audio_separator|>", "<|fim_prefix|>",
+             "<|endofturn|>", "<|unknown|>", std::string("\xc0\xaf", 2)}) {
+        bool rejected = false;
+        try { validate_drama3_system_prompt(text); }
+        catch (const rt::InvalidRequestError & error) {
+            rejected = true;
+            require(std::string(error.what()).find(text) == std::string::npos,
+                    "private system prompt leaked in error");
+        }
+        require(rejected, "invalid system prompt was accepted");
+    }
+}
+
 void codec_override_and_cleanup() {
     using engine::codecs::detail::validate_encoder_chunk_samples;
     validate_encoder_chunk_samples(0, false);
@@ -127,6 +145,7 @@ int main() {
         inline_input_is_reference_only();
         rejects_invalid_requests_without_echoing_payload();
         path_and_ordinary_text_contracts_are_preserved();
+        system_prompt_validation_is_private();
         codec_override_and_cleanup();
         std::cout << "Drama 3 inline reference request checks passed\n";
     } catch (const std::exception & error) {

@@ -239,7 +239,8 @@ void Drama3Generator::warm_streaming_codec(const codecs::FishDacCodes & referenc
 
 Drama3Generation Drama3Generator::generate(const std::string & text, const std::vector<Drama3Take> & references,
     const std::vector<Drama3Take> & history, const Drama3Sampling & sampling, bool streaming,
-    const std::function<void(const runtime::AudioBuffer &)> & on_audio, bool continuation) {
+    const std::function<void(const runtime::AudioBuffer &)> & on_audio, bool continuation,
+    const std::optional<std::string> & system_prompt) {
     if (!std::isfinite(sampling.temperature) || sampling.temperature < 0 ||
         !std::isfinite(sampling.top_p) || sampling.top_p <= 0 || sampling.top_p > 1 ||
         sampling.top_k <= 0 || sampling.max_frames <= 0) throw runtime::InvalidRequestError("invalid Drama 3 sampling parameters");
@@ -255,7 +256,7 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         first_audio_phases.emplace_back(name, std::chrono::duration<double, std::milli>(now - profile_marked).count());
         profile_marked = now;
     };
-    const auto prompt = build_drama3_prompt(*assets_, tokenizer_, text, references, history);
+    const auto prompt = build_drama3_prompt(*assets_, tokenizer_, text, references, history, system_prompt);
     if (sampling.max_frames > cache_steps_ ||
         prompt.size() > static_cast<size_t>(cache_steps_ - sampling.max_frames)) {
         throw runtime::CapacityError("Drama 3 prompt plus max_tokens exceeds fish_drama3.context_length; increase it or shorten history");

@@ -328,6 +328,27 @@ Save the following as `drama3-server.json` in the repository root:
 The server exposes `POST /v1/audio/speech` and the task APIs, including streaming
 events and continuation artifacts. See the [server guide](../../app/server/README.md).
 
+## Optional system instruction
+
+For a single request, set the string `options.system_prompt` to replace the
+default system instruction. Omitting the option preserves the existing prompt;
+an explicitly empty string selects an empty instruction. The instruction is
+separate from the speech text, reference blocks and earlier takes. Those blocks
+remain in their existing order. For example, a generic task request can include:
+
+```json
+{"model":"drama-3","request":{"text":"Hello there.","options":{"system_prompt":"Speak calmly and clearly."}}}
+```
+
+The same option is available on task streaming and the speech API's `options`
+object. The JSON interface rejects U+0000 in this field because the current
+JSON parser cannot preserve it. Structural-token delimiters such as `<|` are rejected;
+the ordinary text and speaker-tag syntax is unchanged. The instruction counts
+towards the model's context alongside references, text and generation budget.
+Do not place private instructions in model configuration, URL query parameters,
+logs or shared recordings. A valid request does not guarantee that the model
+will obey an instruction or speak every word; assess the resulting audio.
+
 ## Voice references
 
 For cloning, add `--voice-ref reference.wav` and

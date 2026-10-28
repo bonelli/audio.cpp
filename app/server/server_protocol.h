@@ -64,6 +64,12 @@ struct SpeechRequestContext {
 engine::runtime::TaskRequest build_speech_request(
     const engine::io::json::Value &body,
     const SpeechRequestContext &context);
+void validate_drama3_system_prompt(const engine::io::json::Value &request,
+                                   const ServerModelConfig &model);
+void validate_drama3_system_prompt_wire(const std::string &body,
+                                        const engine::io::json::Value &parsed,
+                                        const ServerModelConfig &model,
+                                        bool batch, bool nested_request);
 engine::runtime::TaskRequest apply_default_request_options(
     const std::unordered_map<std::string, std::string> &default_options,
     engine::runtime::TaskRequest request);

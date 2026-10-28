@@ -1,6 +1,7 @@
 #include "server_protocol.h"
 
 #include "speech_option_exceptions.h"
+#include "system_prompt_wire.h"
 #include "../cli/request.h"
 #include "../common/base64.h"
 
@@ -77,6 +78,26 @@ bool ambiguous_drama3_inline_reference(const Value &request, const ServerModelCo
   catch (const std::runtime_error &) {
     throw engine::runtime::InvalidRequestError("encode_reference_only must be true/false, yes/no, on/off, or 1/0");
   }
+}
+
+void validate_drama3_system_prompt(const Value &request, const ServerModelConfig &model) {
+  if (model.family != "fish_drama3") return;
+  const auto *options = request.find("options");
+  if (options == nullptr || options->is_null() || !options->is_object()) return;
+  const auto *value = options->find("system_prompt");
+  if (value != nullptr && !value->is_string()) {
+    throw engine::runtime::InvalidRequestError("options.system_prompt must be a string");
+  }
+}
+
+void validate_drama3_system_prompt_wire(const std::string &body, const Value &parsed,
+                                        const ServerModelConfig &model, bool batch, bool nested_request) {
+  if (model.family != "fish_drama3") return;
+  if (body.find("\\u0000") == std::string::npos && body.find('\0') == std::string::npos) return;
+  const auto shape = batch ? SystemPromptRequestShape::Batch :
+      (nested_request && parsed.find("request") != nullptr ? SystemPromptRequestShape::NestedRequest :
+                                                             SystemPromptRequestShape::Root);
+  SystemPromptWireScan(body, shape).validate();
 }
 
 engine::runtime::TaskRequest
@@ -797,7 +818,7 @@ bool has_private_reference(const Value &value) {
     for (const auto &child : value.as_array()) if (has_private_reference(child)) return true;
   } else if (value.is_object()) {
     for (const auto &[key, child] : value.as_object()) {
-      if (key == "audio_base64" || key == "voice_ref" || key == "reference_text" ||
+      if (key == "system_prompt" || key == "audio_base64" || key == "voice_ref" || key == "reference_text" ||
           key == "references" || key == "multi_reference_cond" || key == "artifacts" ||
           key == "previous_takes" || key == "previous_takes_file" || key == "vq_codes") return true;
       if (has_private_reference(child)) return true;
@@ -806,10 +827,6 @@ bool has_private_reference(const Value &value) {
   return false;
 }
 
-bool is_reference_request_path(const std::string &path) {
-  return path == "/v1/tasks/run" || path == "/v1/tasks/batch" || path == "/v1/tasks/stream" ||
-         path == "/v1/audio/speech";
-}
 }
 
 void log_request_body_if_enabled(const ServerConfig &config,
@@ -821,29 +838,26 @@ void log_request_body_if_enabled(const ServerConfig &config,
     return;
   }
   if (!request.body.empty() && is_json_content_type(request)) {
-    if (is_reference_request_path(request.path)) {
-      // Avoid decoding and copying common large payloads solely to decide
-      // whether to log them. A false positive only suppresses debug logging.
-      for (const auto *key : {"\"audio_base64\"", "\"voice_ref\"", "\"reference_text\"", "\"references\"",
-                              "\"multi_reference_cond\"", "\"artifacts\"", "\"previous_takes\"",
-                              "\"previous_takes_file\"", "\"vq_codes\""}) {
-        if (request.body.find(key) != std::string::npos) {
-          engine::debug::log_message("[REQUEST_BODY_SKIPPED] reference-bearing JSON");
-          return;
-        }
-      }
-      // Parse the uncommon case too: JSON keys may use Unicode escapes, and
-      // malformed bodies may contain private values even if they cannot run.
-      try {
-        const auto json = engine::io::json::parse(request.body);
-        if (has_private_reference(json)) {
-          engine::debug::log_message("[REQUEST_BODY_SKIPPED] reference-bearing JSON");
-          return;
-        }
-      } catch (const std::runtime_error &) {
-        engine::debug::log_message("[REQUEST_BODY_SKIPPED] invalid JSON");
+    // A private option may be sent to any route, including an invalid one.
+    // Avoid decoding common large payloads solely to decide whether to log.
+    for (const auto *key : {"\"system_prompt\"", "\"audio_base64\"", "\"voice_ref\"", "\"reference_text\"", "\"references\"",
+                            "\"multi_reference_cond\"", "\"artifacts\"", "\"previous_takes\"",
+                            "\"previous_takes_file\"", "\"vq_codes\""}) {
+      if (request.body.find(key) != std::string::npos) {
+        engine::debug::log_message("[REQUEST_BODY_SKIPPED] private JSON");
         return;
       }
+    }
+    // Escaped keys and malformed JSON need the parser on every route.
+    try {
+      const auto json = engine::io::json::parse(request.body);
+      if (has_private_reference(json)) {
+        engine::debug::log_message("[REQUEST_BODY_SKIPPED] private JSON");
+        return;
+      }
+    } catch (const std::runtime_error &) {
+      engine::debug::log_message("[REQUEST_BODY_SKIPPED] invalid JSON");
+      return;
     }
     engine::debug::log_message("[REQUEST_BODY] " + request.method + " " +
                                request.path);
@@ -860,9 +874,6 @@ void log_request_body_if_enabled(const ServerConfig &config,
     out << " body=stream";
   } else {
     out << " body_bytes=" << request.body.size();
-  }
-  if (!request.query.empty()) {
-    out << " query=" << json_quote(request.query);
   }
   engine::debug::log_message(out.str());
 }

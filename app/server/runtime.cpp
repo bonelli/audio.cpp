@@ -760,6 +760,7 @@ ServerState::LoadedModel & ServerState::require_model(const Value & body) {
 
 engine::runtime::TaskRequest ServerState::build_speech_request(const LoadedModel & model, const Value & body) const {
     std::shared_lock<std::shared_mutex> metadata_lock(model.metadata_mutex);
+    validate_drama3_system_prompt(body, model.config);
     return minitts::server::build_speech_request(
         body,
         SpeechRequestContext{
@@ -878,6 +879,7 @@ ServerState::TimedTaskResult ServerState::run_streaming_model_from(
 HttpResponse ServerState::handle_speech(const std::string & body_text) {
     const auto body = engine::io::json::parse(body_text);
     auto & model = require_model(body);
+    validate_drama3_system_prompt_wire(body_text, body, model.config, false, false);
     const auto request = build_speech_request(model, body);
     if (body.find("stream_format") != nullptr || bool_field(body, "stream", false)) {
         return handle_speech_stream(model, request, body);
@@ -1110,10 +1112,10 @@ HttpResponse ServerState::handle_speech_live(const HttpRequest & request) {
         add_query_option("repetition_penalty", "repetition_penalty");
         add_query_option("guidance_scale", "guidance_scale");
         add_query_option("num_inference_steps", "num_inference_steps");
-        add_query_option("instructions", "system_prompt");
+        if (model.config.family != "fish_drama3") add_query_option("instructions", "system_prompt");
         add_query_option("reference_text", "reference_text");
         add_query_option("voice_id", "voice_id");
-        add_query_option("system_prompt", "system_prompt");
+        if (model.config.family != "fish_drama3") add_query_option("system_prompt", "system_prompt");
         add_query_option("text_temperature", "text_temperature");
         add_query_option("text_top_k", "text_top_k");
         add_query_option("do_sample", "do_sample");
@@ -1994,8 +1996,10 @@ engine::runtime::TaskRequest drop_unsupported_language_option(
 HttpResponse ServerState::handle_generic_run(const std::string & body_text) {
     const auto body = engine::io::json::parse(body_text);
     auto & model = require_model(body);
+    validate_drama3_system_prompt_wire(body_text, body, model.config, false, true);
     const auto * request_json = body.find("request");
     const auto & effective_json = request_json != nullptr ? *request_json : body;
+    validate_drama3_system_prompt(effective_json, model.config);
     if (ambiguous_drama3_inline_reference(effective_json, model.config)) {
         return error_response(400, "provide only one of audio input or voice_ref for reference encoding", "invalid_request_error");
     }
@@ -2040,6 +2044,7 @@ HttpResponse ServerState::handle_generic_run(const std::string & body_text) {
 HttpResponse ServerState::handle_generic_batch(const std::string & body_text) {
     const auto body = engine::io::json::parse(body_text);
     auto & model = require_model(body);
+    validate_drama3_system_prompt_wire(body_text, body, model.config, true, false);
     if (model_run_mode(model) != engine::runtime::RunMode::Offline) {
         return error_response(
             400,
@@ -2063,6 +2068,7 @@ HttpResponse ServerState::handle_generic_batch(const std::string & body_text) {
                 "task batch entries must be JSON objects",
                 "invalid_request_error");
         }
+        validate_drama3_system_prompt(request_json, model.config);
         requests.push_back(apply_default_request_options(
             model.config.default_request_options,
             drop_unsupported_language_option(
@@ -2145,9 +2151,11 @@ HttpResponse ServerState::handle_generic_batch(const std::string & body_text) {
 HttpResponse ServerState::handle_generic_stream(const std::string & body_text) {
     const auto body = engine::io::json::parse(body_text);
     auto & model = require_model(body);
+    validate_drama3_system_prompt_wire(body_text, body, model.config, false, true);
     const bool sse = task_stream_sse_requested(body);
     const auto * request_json = body.find("request");
     const auto & effective_json = request_json != nullptr ? *request_json : body;
+    validate_drama3_system_prompt(effective_json, model.config);
     auto request = apply_default_request_options(
         model.config.default_request_options,
         drop_unsupported_language_option(

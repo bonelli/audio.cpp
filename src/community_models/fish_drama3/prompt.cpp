@@ -3,8 +3,10 @@
 #include "engine/framework/runtime/errors.h"
 
 #include <array>
+#include <limits>
 #include <regex>
 #include <stdexcept>
+#include <utf8proc.h>
 
 namespace engine::models::fish_drama3 {
 namespace {
@@ -63,6 +65,26 @@ void validate_drama3_text(const std::string & text, const char * location) {
     }
 }
 
+void validate_drama3_system_prompt(const std::string & text) {
+    // No structural token (including unknown or malformed token prefixes) may
+    // be introduced into the system turn by request-supplied text.
+    if (text.find("<|") != std::string::npos) {
+        throw runtime::InvalidRequestError("Drama 3 system_prompt contains a reserved structural delimiter");
+    }
+    if (text.size() > static_cast<size_t>(std::numeric_limits<utf8proc_ssize_t>::max())) {
+        throw runtime::InvalidRequestError("Drama 3 system_prompt is too large to validate");
+    }
+    size_t offset = 0;
+    while (offset < text.size()) {
+        utf8proc_int32_t codepoint = 0;
+        const auto width = utf8proc_iterate(
+            reinterpret_cast<const utf8proc_uint8_t *>(text.data() + offset),
+            static_cast<utf8proc_ssize_t>(text.size() - offset), &codepoint);
+        if (width <= 0) throw runtime::InvalidRequestError("Drama 3 system_prompt must be valid UTF-8");
+        offset += static_cast<size_t>(width);
+    }
+}
+
 void validate_drama3_codes(const codecs::FishDacCodes & codes, int64_t size) {
     if (codes.codebooks != 10 || codes.frames <= 0 ||
         codes.codes.size() != static_cast<size_t>(codes.frames * codes.codebooks)) {
@@ -75,7 +97,9 @@ void validate_drama3_codes(const codecs::FishDacCodes & codes, int64_t size) {
 
 std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
     const Drama3TextTokenizer & tokenizer, const std::string & text,
-    const std::vector<Drama3Take> & references, const std::vector<Drama3Take> & history) {
+    const std::vector<Drama3Take> & references, const std::vector<Drama3Take> & history,
+    const std::optional<std::string> & system_prompt) {
+    if (system_prompt) validate_drama3_system_prompt(*system_prompt);
     std::vector<Drama3Frame> frames;
     const auto append_text = [&](const std::string & segment) {
         for (const auto token : tokenizer.encode(segment)) {
@@ -94,7 +118,7 @@ std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
         }
     };
     append_text("<|im_start|>system\n");
-    append_text(references.empty() ? "convert the provided text to speech" : "convert the provided text to speech reference to the following:");
+    append_text(system_prompt ? *system_prompt : (references.empty() ? "convert the provided text to speech" : "convert the provided text to speech reference to the following:"));
     for (size_t index = 0; index < references.size(); ++index) {
         validate_drama3_text(references[index].text, "reference");
         append_text("\n\n[Reference " + std::to_string(index + 1) + "]\nText: " + tagged(references[index].text, true) + "\nSpeech: ");

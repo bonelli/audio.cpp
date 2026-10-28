@@ -2,6 +2,7 @@
 // request leaves unset, for named and default presets alike, and the server never
 // interprets them.
 #include "server_protocol.h"
+#include "../../app/cli/request.h"
 
 #include "engine/framework/io/json.h"
 
@@ -10,7 +11,9 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -40,6 +43,52 @@ engine::runtime::TaskRequest speech(
 
 int main() {
     try {
+        minitts::server::ServerModelConfig model;
+        model.family = "fish_drama3";
+        for (const auto & raw : {"{}", "{\"options\":{\"system_prompt\":\"\"}}", "{\"options\":{\"system_prompt\":\"ordinary\"}}"}) {
+            minitts::server::validate_drama3_system_prompt(engine::io::json::parse(raw), model);
+        }
+        model.family = "another_family";
+        minitts::server::validate_drama3_system_prompt(
+            engine::io::json::parse("{\"options\":{\"system_prompt\":123}}"), model);
+        for (const auto & value : {"", "Speak clearly"}) {
+            const std::string raw = "{\"input\":\"hello\",\"options\":{\"system_prompt\":\"" + std::string(value) + "\"}}";
+            const auto speech_request = speech({}, {}, {}, raw);
+            expect(speech_request.options.at("system_prompt") == value, "speech system_prompt changed");
+            const auto task_request = minitts::cli::build_request_from_json(
+                engine::io::json::parse("{\"text\":\"hello\",\"options\":{\"system_prompt\":\"" + std::string(value) + "\"}}"),
+                fs::current_path());
+            expect(task_request.options.at("system_prompt") == value, "task system_prompt changed");
+        }
+        model.family = "fish_drama3";
+        for (const auto & [raw, batch, nested, rejected] :
+             std::vector<std::tuple<std::string, bool, bool, bool>>{
+                {R"({"options":{"system_prompt":"a\u0000b"}})", false, false, true},
+                {std::string("{\"options\":{\"system_prompt\":\"a") + '\0' + "b\"}}", false, false, true},
+                {std::string("\xef\xbb\xbf") + R"({"options":{"system_prompt":"a\u0000b"}})", false, false, true},
+                {R"({"request":{"options":{"system_\u0070rompt":"a\u0000b"}}})", false, true, true},
+                {R"({"requests":[{"options":{"system_prompt":"a\u0000b"}}]})", true, false, true},
+                {R"({"options":{"system_prompt\u0000extra":"a"}})", false, false, true},
+                {R"({"options\u0000extra":{"system_prompt":"a"}})", false, false, true},
+                {R"({"options\u0000extra":{"different":"a"}})", false, false, false},
+                {R"({"options":{"system_prompt":"literal \\u0000"}})", false, false, false},
+                {R"({"options":{"system_prompt":"quote \" and backslash \\ then normal"}})", false, false, false},
+                {R"({"text":"a\u0000b","options":{"system_prompt":"normal"}})", false, false, false},
+                {R"({"meta":{"options":{"system_prompt":"a\u0000b"}},"options":{"system_prompt":"normal"}})", false, false, false},
+                {R"({"request":{"options":{"system_prompt":"normal"}},"options":{"system_prompt":"a\u0000b"}})", false, true, false},
+                {R"({"options":{"different\u0000key":"a"}})", false, false, false},
+             }) {
+            bool thrown = false;
+            try { minitts::server::validate_drama3_system_prompt_wire(raw, engine::io::json::parse(raw), model, batch, nested); }
+            catch (const std::exception & error) {
+                thrown = true;
+                expect(std::string(error.what()).find("a\\u0000b") == std::string::npos, "NUL error leaked value");
+            }
+            expect(thrown == rejected, "wrong field was affected by system_prompt NUL guard");
+        }
+        model.family = "another_family";
+        const std::string other = R"({"options":{"system_prompt":"a\u0000b"}})";
+        minitts::server::validate_drama3_system_prompt_wire(other, engine::io::json::parse(other), model, false, false);
         RuntimeVoicePreset narrator;
         narrator.options = {
             {"speaker_embedding_file", "/voices/narrator.speaker.safetensors"},

@@ -1188,6 +1188,12 @@ void inline_audio_request_logging() {
     (void)post(*f.state, "/v1/tasks/run", "{\"model\":\"logging\",\"audio_\\u0062ase64\":\"SENSITIVE_AUDIO_ESCAPED\"}");
     for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
          {"/v1/tasks/run", "{\"model\":\"logging\",\"request\":{\"options\":{\"references\":\"SENSITIVE_CODES\"}}}"},
+         {"/v1/tasks/run", "{\"model\":\"logging\",\"request\":{\"options\":{\"system_prompt\":\"SENSITIVE_PROMPT\"}}}"},
+         {"/v1/tasks/stream", "{\"model\":\"logging\",\"request\":{\"options\":{\"system_\\u0070rompt\":\"SENSITIVE_ESCAPED_PROMPT\"}}}"},
+         {"/v1/audio/speech", "{\"model\":\"logging\",\"options\":{\"system_prompt\":\"SENSITIVE_BROKEN_PROMPT\""},
+         {"/not-a-route", "{\"options\":{\"system_prompt\":\"SENSITIVE_WRONG_ROUTE\"}}"},
+         {"/not-a-route", "{\"options\":{\"system_\\u0070rompt\":\"SENSITIVE_WRONG_ESCAPED\"}}"},
+         {"/not-a-route", "{\"system_\\u0070rompt\":\"SENSITIVE_WRONG_MALFORMED\""},
          {"/v1/tasks/batch", "{\"model\":\"logging\",\"requests\":[{\"options\":{\"multi_reference_cond\":\"SENSITIVE_MULTI\"}}]}"},
          {"/v1/tasks/stream", "{\"model\":\"logging\",\"request\":{\"artifacts\":[{\"payload\":\"SENSITIVE_ARTIFACT\"}]}}"},
          {"/v1/audio/speech", "{\"model\":\"logging\",\"voice_\\u0072ef\":\"SENSITIVE_VOICE\"}"},
@@ -1241,6 +1247,38 @@ void generic_inline_audio_transport() {
     require(ambiguous.status == 400 && offline->runs == calls, "invalid audio reached the session");
     auto drama = f.add("drama-ambiguous", "offline");
     Access::model(*f.state, "drama-ambiguous").config.family = "fish_drama3";
+    for (const auto & value : {"null", "123", "false", "{\"private\":\"SENSITIVE_BAD_VALUE\"}", "[\"SENSITIVE_BAD_VALUE\"]"}) {
+        for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
+            {"/v1/tasks/run", "{\"model\":\"drama-ambiguous\",\"request\":{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}}"},
+            {"/v1/tasks/stream", "{\"model\":\"drama-ambiguous\",\"request\":{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}}"},
+            {"/v1/tasks/batch", "{\"model\":\"drama-ambiguous\",\"requests\":[{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}]}"},
+            {"/v1/audio/speech", "{\"model\":\"drama-ambiguous\",\"input\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}"}}) {
+            const auto result = post(*f.state, path, body);
+            require(result.status == 400 && result.body.find("options.system_prompt must be a string") != std::string::npos &&
+                    result.body.find("SENSITIVE_BAD_VALUE") == std::string::npos && drama->loads == 0,
+                    "parallel system_prompt type rejection failed on " + path);
+        }
+    }
+    for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
+        {"/v1/tasks/run", R"({"model":"drama-ambiguous","request":{"options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}}})"},
+        {"/v1/tasks/stream", R"({"model":"drama-ambiguous","request":{"options":{"system_\u0070rompt":"SENSITIVE\u0000TRUNCATED"}}})"},
+        {"/v1/tasks/batch", R"({"model":"drama-ambiguous","requests":[{"options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}}]})"},
+        {"/v1/audio/speech", R"({"model":"drama-ambiguous","input":"hi","options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}})"}}) {
+        const auto result = post(*f.state, path, body);
+        require(result.status == 400 && result.body.find("cannot contain NUL") != std::string::npos &&
+                result.body.find("SENSITIVE") == std::string::npos && drama->loads == 0,
+                "parallel system_prompt NUL rejection failed on " + path);
+    }
+    for (const std::string path : {"/v1/tasks/run", "/v1/tasks/stream", "/v1/tasks/batch", "/v1/audio/speech"}) {
+        std::string error;
+        try {
+            const auto result = post(*f.state, path, "{\"options\":{\"system_prompt\":\"SENSITIVE_DUP_KEY\",\"SENSITIVE_DUP_KEY\":1,\"SENSITIVE_DUP_KEY\":2}}");
+            if (result.status != 500) throw std::runtime_error("unexpected malformed JSON status");
+            error = result.body;
+        } catch (const std::runtime_error & ex) { error = ex.what(); }
+        require(error.find("duplicate json object key") != std::string::npos && error.find("SENSITIVE_DUP_KEY") == std::string::npos,
+                "parallel invalid JSON exposed private content on " + path);
+    }
     const auto voice_conflict = post(*f.state, "/v1/tasks/run",
         "{\"model\":\"drama-ambiguous\",\"request\":{\"audio_base64\":\"AAAA\",\"voice_ref\":\"private-missing.wav\",\"options\":{\"encode_reference_only\":true}}}");
     require(voice_conflict.status == 400 && voice_conflict.body.find("only one") != std::string::npos &&

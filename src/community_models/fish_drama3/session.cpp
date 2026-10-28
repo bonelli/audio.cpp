@@ -131,6 +131,11 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     if (request.voice) effective.voice = request.voice;
     for (const auto & option : request.options) effective.options[option.first] = option.second;
     effective.input_artifacts = request.input_artifacts;
+    std::optional<std::string> system_prompt;
+    if (const auto it = request.options.find("system_prompt"); it != request.options.end()) {
+        system_prompt = it->second;
+        validate_drama3_system_prompt(*system_prompt);
+    }
     bool encode_only = false;
     try {
         if (const auto prepare = runtime::find_option(effective.options, {"encode_reference_only"})) {
@@ -203,7 +208,7 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
         const auto descriptors = parse_conditioning_json(takes_file ? engine::io::read_text_file(*takes_file) : *takes);
         const auto append_take = [&](const json::Value & value) {
             if (value.is_string()) {
-                auto generated = generator_->generate(value.as_string(), references, history, sampling, false);
+                auto generated = generator_->generate(value.as_string(), references, history, sampling, false, {}, false, system_prompt);
                 history.push_back({value.as_string(), std::move(generated.codes)});
             } else history.push_back(conditioning_take(value));
         };
@@ -235,7 +240,7 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
             };
         }
         const auto & text = chunks[index].text_input->text;
-        auto generated = generator_->generate(text, references, context, chunk_sampling, streaming, callback, index > 0);
+        auto generated = generator_->generate(text, references, context, chunk_sampling, streaming, callback, index > 0, system_prompt);
         runtime::append_audio_buffer(merged, generated.audio);
         limited = limited || generated.reached_limit;
         generated_takes.push_back({text, std::move(generated.codes)});

@@ -341,7 +341,7 @@ void test_duplicate_json_keys_are_rejected() {
   }
 })JSON");
     } catch (const std::runtime_error & error) {
-        rejected = std::string(error.what()).find("duplicate json object key: voice_presets") != std::string::npos;
+        rejected = std::string(error.what()) == "duplicate json object key";
     }
     require(rejected, "duplicate json object keys are rejected");
 }
