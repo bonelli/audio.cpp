@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -72,9 +71,8 @@ private:
 // Startup-only opt-in. Call before starting concurrent parser users; no toggle back.
 void enable_serialized_json_parsing();
 Value parse(std::string_view text);
-// Identify routing fields without converting nested objects; malformed or
-// ambiguous root routing fields return nullopt. Used only on parse failure.
-std::optional<Value> inspect_root_routing(std::string_view text);
+// Check JSON object syntax without converting members or rejecting duplicates.
+bool is_json_object_syntax(std::string_view text);
 Value parse_jsonc(std::string_view text);
 Value parse_file(const std::filesystem::path & path);
 Value parse_jsonc_file(const std::filesystem::path & path);

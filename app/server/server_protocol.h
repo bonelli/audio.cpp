@@ -85,7 +85,8 @@ void validate_drama3_system_prompt_wire(const std::string &body,
                                         const engine::io::json::Value &parsed,
                                         const ServerModelConfig &model,
                                         bool batch, bool nested_request,
-                                        bool speech_route = false);
+                                        bool speech_route = false,
+                                        bool canonical_path_only = false);
 engine::io::json::Value parse_task_body_guarded(
     const std::string &body,
     const std::function<std::optional<ServerModelConfig>(const engine::io::json::Value &)> &lookup,

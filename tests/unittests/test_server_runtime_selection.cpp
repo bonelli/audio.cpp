@@ -319,6 +319,8 @@ int main() {
                  R"("options":{"system_prompt\u0000extra":"private","system_prompt":"normal"})",
                  R"("options":{"system_prompt":"normal"},"options\u0000extra":{"other":"private"})",
                  R"("options":{"encode_reference_only":false,"system_prompt":"normal"},"options\u0000extra":{"other":"private"})",
+                 R"("options":{"system_prompt":"private\u0000value"},"options\u0000extra":{"encode_reference_only":true})",
+                 R"("options\u0000extra":{"encode_reference_only":true},"options":{"system_prompt":"private\u0000value"})",
                  R"("options\u0000extra":{"other":"private"},"options":{"system_prompt":"normal"})"}) {
             for (const auto & path : {"/v1/tasks/run", "/v1/tasks/stream", "/v1/audio/speech"}) {
                 const std::string fields = std::string(option_fields);

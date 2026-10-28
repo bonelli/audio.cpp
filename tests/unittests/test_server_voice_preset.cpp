@@ -167,11 +167,146 @@ int main() {
                 R"({"model":"test","request":{"options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{"encode_reference_only":true}}})",
                 R"({"model":"test","request":{"options\u0000suffix":{"encode_reference_only":true},"options":{"system_prompt":"x\u0000y"}}})"
             }) {
+                bool rejected = false;
+                try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) { rejected = true; }
+                expect(rejected, "noncanonical true encoder flag masked system prompt NUL");
+                model.default_request_options["encode_reference_only"] = "true";
                 bool original_error = false;
                 try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, true); }
                 catch (const engine::runtime::InvalidRequestError &) {}
                 catch (const std::runtime_error &) { original_error = true; }
-                expect(original_error, "ambiguous true encoder flag changed parse classification");
+                expect(original_error, "canonical encoder default changed parse classification");
+                model.default_request_options.clear();
+            }
+            for (const auto & raw : {
+                R"({"model":"test","request":{"options":{"encode_reference_only":true,"system_prompt":"x\u0000y"},"options\u0000suffix":{"encode_reference_only":false}}})",
+                R"({"model":"test","request":{"options\u0000suffix":{"encode_reference_only":false},"options":{"encode_reference_only":true,"system_prompt":"x\u0000y"}}})"
+            }) {
+                bool original_error = false;
+                try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) {}
+                catch (const std::runtime_error &) { original_error = true; }
+                expect(original_error, "explicit canonical encoder mode changed parse classification");
+            }
+            model.default_request_options["encode_reference_only"] = "true";
+            for (const auto & raw : {
+                R"({"model":"test","request":{"options":{"encode_reference_only":false,"system_prompt":"x\u0000y"},"options\u0000suffix":{"encode_reference_only":true}}})",
+                R"({"model":"test","request":{"options\u0000suffix":{"encode_reference_only":true},"options":{"encode_reference_only":false,"system_prompt":"x\u0000y"}}})",
+                R"({"model":"test","request":{"opt\u0069ons":{"encode_reference_only":false,"system_prompt":"x\u0000y"},"options\u0000suffix":{"encode_reference_only":true}}})"
+            }) {
+                bool rejected = false;
+                try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) { rejected = true; }
+                expect(rejected, "explicit canonical synthesis mode was masked");
+            }
+            model.default_request_options.clear();
+            for (const auto & raw : {
+                R"({"model":"test","request":{"options":{"system_prompt":"x\u0000y"},"options":{"encode_reference_only":false}}})",
+                R"({"model":"test","request":{"options":{"encode_reference_only":false,"encode_reference_only":true,"system_prompt":"x\u0000y"}}})"
+            }) {
+                bool original_error = false;
+                try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) {}
+                catch (const std::runtime_error &) { original_error = true; }
+                expect(original_error, "duplicate canonical key changed parse classification");
+            }
+            for (const auto & raw : {
+                R"({"model":"test","model\u0000suffix":"other","request":{"options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{}}})",
+                R"({"model\u0000suffix":"other","model":"test","request":{"options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{}}})",
+                R"({"model":"test","request\u0000suffix":{},"request":{"options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{}}})",
+                R"({"model":"test","request":{"options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{}},"request\u0000suffix":{}})"
+            }) {
+                bool rejected = false;
+                try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) { rejected = true; }
+                expect(rejected, "noncanonical routing key masked synthesis instruction NUL");
+            }
+            {
+                const auto missing_model = R"({"model\u0000suffix":"test","request":{"options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{}}})";
+                bool original_error = false;
+                try { (void) minitts::server::parse_task_body_guarded(missing_model, lookup, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) {}
+                catch (const std::runtime_error &) { original_error = true; }
+                expect(original_error, "noncanonical model key was treated as canonical");
+            }
+            for (const auto & raw : {
+                R"({"model":"test","request":{"options":{"system_prompt":"safe"}},"request\u0000suffix":{"options":{"system_prompt":"x\u0000y"}}})",
+                R"({"model":"test","request\u0000suffix":{"options":{"system_prompt":"x\u0000y"}},"request":{"options":{"system_prompt":"safe"}}})",
+                R"({"model":"test","request":{"options":{"system_prompt":"safe","encode_reference_only":false}},"request\u0000suffix":{"options":{"system_prompt":"x\u0000y","encode_reference_only":true}}})",
+                R"({"model":"test","request":{"options\u0000suffix":{"system_prompt":"x\u0000y"},"other":1,"other\u0000suffix":2}})",
+                R"({"model":"test","request":{"options":{"system_prompt\u0000suffix":"x\u0000y","other":1,"other\u0000suffix":2}}})"
+            }) {
+                bool original_error = false;
+                try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) {}
+                catch (const std::runtime_error &) { original_error = true; }
+                expect(original_error, "noncanonical request changed canonical instruction validation");
+            }
+            {
+                const auto raw = R"({"model":"test","input":"hi","request":{"options":{"system_prompt":"x\u0000y"}},"options":{"seed":5},"options\u0000suffix":{}})";
+                bool original_error = false;
+                try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) {}
+                catch (const std::runtime_error &) { original_error = true; }
+                expect(original_error, "speech incorrectly treated nested request as its instruction");
+            }
+            {
+                const auto raw = R"({"model":"test","request\u0000suffix":{"options":{"system_prompt":"x\u0000y"}}})";
+                const auto parsed = engine::io::json::parse(raw);
+                bool rejected = false;
+                try { minitts::server::validate_drama3_system_prompt_wire(raw, parsed, model, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) { rejected = true; }
+                expect(rejected, "ordinary cJSON request alias allowed NUL instruction truncation");
+            }
+            {
+                const auto speech = R"({"model":"test","input":"hi","voice":"sample","options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{"encode_reference_only":true}})";
+                minitts::server::ServerModelConfig::VoicePreset preset;
+                preset.options["encode_reference_only"] = "false";
+                model.default_request_options["encode_reference_only"] = "true";
+                model.voice_presets["sample"] = preset;
+                bool rejected = false;
+                try { (void) minitts::server::parse_task_body_guarded(speech, lookup, false, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) { rejected = true; }
+                expect(rejected, "canonical voice preset did not override encoder default");
+                model.voice_presets["sample"].options["encode_reference_only"] = "true";
+                model.default_request_options["encode_reference_only"] = "false";
+                bool original_error = false;
+                try { (void) minitts::server::parse_task_body_guarded(speech, lookup, false, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) {}
+                catch (const std::runtime_error &) { original_error = true; }
+                expect(original_error, "encoder voice preset changed parse classification");
+                model.default_request_options.clear();
+                model.voice_presets.clear();
+            }
+            {
+                minitts::server::ServerModelConfig::VoicePreset synth;
+                minitts::server::ServerModelConfig::VoicePreset encoder;
+                synth.options["encode_reference_only"] = "false";
+                encoder.options["encode_reference_only"] = "true";
+                model.voice_presets["synth"] = synth;
+                model.voice_presets["encoder"] = encoder;
+                model.default_request_options["encode_reference_only"] = "false";
+                for (const auto & raw : {
+                    R"({"model":"test","input":"hi","voice\u0000suffix":"encoder","options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{}})",
+                    R"({"model":"test","input":"hi","voice":"synth","voice\u0000suffix":"encoder","options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{}})",
+                    R"({"model":"test","input":"hi","voice\u0000suffix":"encoder","voice":"synth","options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{}})"
+                }) {
+                    bool rejected = false;
+                    try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, false, true); }
+                    catch (const engine::runtime::InvalidRequestError &) { rejected = true; }
+                    expect(rejected, "noncanonical voice key masked synthesis instruction NUL");
+                }
+                model.default_voice_preset_id = "encoder";
+                const auto noncanonical_ref = R"({"model":"test","input":"hi","voice_ref\u0000suffix":"ignored","options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{}})";
+                bool original_error = false;
+                try { (void) minitts::server::parse_task_body_guarded(noncanonical_ref, lookup, false, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) {}
+                catch (const std::runtime_error &) { original_error = true; }
+                expect(original_error, "noncanonical voice_ref changed default encoder selection");
+                model.default_voice_preset_id.reset();
+                model.default_request_options.clear();
+                model.voice_presets.clear();
             }
             const auto unrelated = R"({"model":"test","request":{"options":{"different":"one","different\u0000extra":"two"}}})";
             original_error = false;

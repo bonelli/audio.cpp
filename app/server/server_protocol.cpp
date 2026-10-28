@@ -177,7 +177,7 @@ engine::runtime::TaskRequest preserve_request_scoped_drama3_system_prompt(
 
 void validate_drama3_system_prompt_wire(const std::string &body, const Value &parsed,
                                         const ServerModelConfig &model, bool batch, bool nested_request,
-                                        bool speech_route) {
+                                        bool speech_route, bool canonical_path_only) {
   // Drama3 has no native batch implementation. Preserve its existing batch
   // rejection without interpreting an option that cannot reach the model.
   if (model.family != "fish_drama3" || batch) return;
@@ -188,7 +188,7 @@ void validate_drama3_system_prompt_wire(const std::string &body, const Value &pa
   const auto shape = batch ? SystemPromptRequestShape::Batch :
       (nested_request && parsed.find("request") != nullptr ? SystemPromptRequestShape::NestedRequest :
                                                              SystemPromptRequestShape::Root);
-  SystemPromptWireScan(body, shape).validate();
+  SystemPromptWireScan(body, shape, canonical_path_only).validate();
 }
 
 Value parse_task_body_guarded(
@@ -201,10 +201,27 @@ Value parse_task_body_guarded(
     const auto original = std::current_exception();
     if (!batch && (body.find("\\u0000") != std::string::npos || body.find('\0') != std::string::npos)) {
       try {
-        const auto routing = engine::io::json::inspect_root_routing(body);
-        if (routing) {
-          const auto model = lookup(*routing);
-          if (model) validate_drama3_system_prompt_wire(body, *routing, *model, batch, nested_request, speech_route);
+        if (engine::io::json::is_json_object_syntax(body)) {
+          const auto probe = SystemPromptWireScan(body, SystemPromptRequestShape::Root).canonical_routing(nested_request);
+          if (probe.valid && probe.model) {
+            Value::Object fields;
+            fields.emplace("model", *probe.model);
+            Value::Object request_fields;
+            if (probe.voice) request_fields.emplace("voice", *probe.voice);
+            if (probe.voice_ref) request_fields.emplace("voice_ref", *probe.voice_ref);
+            if (probe.flag) {
+              Value::Object options;
+              options.emplace("encode_reference_only", *probe.flag);
+              request_fields.emplace("options", Value::make_object(std::move(options)));
+            }
+            if (nested_request && probe.request_present)
+              fields.emplace("request", Value::make_object(std::move(request_fields)));
+            else
+              for (auto &[key, value] : request_fields) fields.emplace(key, std::move(value));
+            const auto canonical_routing = Value::make_object(std::move(fields));
+            const auto model = lookup(canonical_routing);
+            if (model) validate_drama3_system_prompt_wire(body, canonical_routing, *model, batch, nested_request, speech_route, true);
+          }
         }
       } catch (const engine::runtime::InvalidRequestError &error) {
         const std::string_view message(error.what());
