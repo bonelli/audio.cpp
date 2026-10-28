@@ -1,9 +1,13 @@
 // Public legacy handlers reject every explicit slots field before touching state.
 // Exercise frontend forwarding too; no test hook in the original runtime is needed.
 #include "runtime.h"
+#include "server_protocol.h"
+#include "../../app/common/base64.h"
 #include "engine/framework/io/json.h"
+#include "engine/framework/debug/trace.h"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 
@@ -120,10 +124,11 @@ int main() {
         minitts::server::ServerConfig task_config;
         task_config.backend = engine::core::BackendType::Cpu;
         task_config.ui_enabled = false;
+        task_config.log_request_body = true;
         minitts::server::ServerModelConfig task_model;
         task_model.id = "task";
         task_model.path = std::filesystem::temp_directory_path() / "audiocpp-legacy-task";
-        task_model.family = "loader_free_fixture";
+        task_model.family = "fish_drama3";
         task_model.task = "tts";
         task_model.lazy = true;
         task_config.models.push_back(task_model);
@@ -145,6 +150,52 @@ int main() {
             request.headers["content-type"] = "application/json";
             return tasks.handle(request);
         };
+        // Serial task handlers parse inline WAV before trying the lazy model.
+        constexpr size_t sample_count = 5 * 1024 * 1024 / 2 + 1;
+        const auto wav = minitts::server::encode_pcm16_wav(
+            engine::runtime::AudioBuffer{44100, 1, std::vector<float>(sample_count, 0.1f)});
+        const auto encoded = minitts::app::base64_encode(wav);
+        if (wav.size() <= 5 * 1024 * 1024) throw std::runtime_error("inline fixture is too small");
+        std::string inline_outcome;
+        try {
+            const auto response = post("/v1/tasks/run", "{\"model\":\"task\",\"request\":{\"audio_base64\":\"" +
+                encoded + "\",\"options\":{\"encode_reference_only\":true,\"reference_text\":\"example\"}}}");
+            inline_outcome = response.body;
+        } catch (const std::exception & e) { inline_outcome = e.what(); }
+        if (inline_outcome.find("model path does not exist") == std::string::npos)
+            throw std::runtime_error("serial inline WAV did not reach the lazy model");
+        for (const std::string bad : {"%%%%", "Z2FyYmFnZQ=="}) {
+            const auto response = post("/v1/tasks/run", "{\"model\":\"task\",\"request\":{\"audio_base64\":\"" + bad + "\"}}");
+            if (response.status != 400 || response.body.find(bad) != std::string::npos)
+                throw std::runtime_error("serial inline WAV error did not reject without echoing payload");
+        }
+        const auto ambiguous = post("/v1/tasks/run", "{\"model\":\"task\",\"request\":{\"audio_base64\":\"AAAA\",\"voice_ref\":\"private-missing.wav\",\"options\":{\"encode_reference_only\":true}}}");
+        if (ambiguous.status != 400 || ambiguous.body.find("only one") == std::string::npos ||
+            ambiguous.body.find("private-missing.wav") != std::string::npos || ambiguous.body.find("AAAA") != std::string::npos)
+            throw std::runtime_error("serial handler did not reject ambiguous reference before opening it");
+        const auto invalid_option = post("/v1/tasks/run", "{\"model\":\"task\",\"request\":{\"audio_base64\":\"AAAA\",\"voice_ref\":\"private-missing.wav\",\"options\":{\"encode_reference_only\":\"SENSITIVE_BAD_BOOLEAN\"}}}");
+        if (invalid_option.status != 400 || invalid_option.body.find("encode_reference_only") == std::string::npos ||
+            invalid_option.body.find("private-missing.wav") != std::string::npos ||
+            invalid_option.body.find("SENSITIVE_BAD_BOOLEAN") != std::string::npos)
+            throw std::runtime_error("serial handler leaked or accepted invalid encode-only option");
+        {
+            const auto log = std::filesystem::temp_directory_path() / "audiocpp-serial-reference-logging-test.log";
+            std::filesystem::remove(log);
+            engine::debug::configure_logging({true, log.string()});
+            for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
+                 {"/v1/tasks/run", "{\"model\":\"task\",\"request\":{\"options\":{\"references\":\"SENSITIVE_VQ\"}}}"},
+                 {"/v1/audio/speech", "{\"model\":\"task\",\"voice_\\u0072ef\":\"SENSITIVE_AUDIO\"}"},
+                 {"/v1/tasks/run", "{\"artifacts\":\"SENSITIVE_ARTIFACT\""},
+                 {"/v1/tasks/run", "{\"model\":\"task\",\"text\":\"ORDINARY_SERIAL\"}"}}) {
+                try { (void)post(path, body); } catch (const std::exception &) {}
+            }
+            engine::debug::reset_logging();
+            std::ifstream input(log);
+            const std::string content{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+            std::filesystem::remove(log);
+            if (content.find("SENSITIVE_") != std::string::npos || content.find("ORDINARY_SERIAL") == std::string::npos)
+                throw std::runtime_error("serial handler logged reference data or skipped an ordinary request");
+        }
         for (const auto & [bad, message] : std::vector<std::pair<std::string, std::string>>{
                  {"{}", "artifacts must be an array of artifact objects"},
                  {"[{\"id\":\"x\",\"kind\":\"tokens\",\"payload\":\"\"}]", "artifacts[0] (x): unknown kind 'tokens'"},

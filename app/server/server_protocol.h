@@ -67,6 +67,8 @@ engine::runtime::TaskRequest build_speech_request(
 engine::runtime::TaskRequest apply_default_request_options(
     const std::unordered_map<std::string, std::string> &default_options,
     engine::runtime::TaskRequest request);
+bool ambiguous_drama3_inline_reference(const engine::io::json::Value &request,
+                                       const ServerModelConfig &model);
 std::string safe_upload_name(std::string value);
 ServerModelConfig
 model_config_from_json(const engine::io::json::Value &body,

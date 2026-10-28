@@ -9,6 +9,7 @@
 #include "engine/framework/model_spec/options.h"
 #include "engine/framework/model_spec/package.h"
 #include "engine/framework/runtime/errors.h"
+#include "engine/framework/runtime/options.h"
 
 #include <algorithm>
 #include <cctype>
@@ -61,6 +62,21 @@ engine::runtime::TaskRequest apply_default_request_options(
   }
   request.options = std::move(options);
   return request;
+}
+
+bool ambiguous_drama3_inline_reference(const Value &request, const ServerModelConfig &model) {
+  const auto *audio = request.find("audio_base64");
+  const auto *voice = request.find("voice_ref");
+  if (model.family != "fish_drama3" || audio == nullptr || audio->is_null() ||
+      voice == nullptr || voice->is_null()) return false;
+  auto options = model.default_request_options;
+  for (auto &[key, value] : options_from_object(request.find("options"))) options[key] = std::move(value);
+  const auto selected = engine::runtime::find_option(options, {"encode_reference_only"});
+  if (!selected) return false;
+  try { return engine::runtime::parse_bool_option(*selected, "encode_reference_only"); }
+  catch (const std::runtime_error &) {
+    throw engine::runtime::InvalidRequestError("encode_reference_only must be true/false, yes/no, on/off, or 1/0");
+  }
 }
 
 engine::runtime::TaskRequest
@@ -775,6 +791,27 @@ static std::string request_content_type(const HttpRequest &request) {
   return it == request.headers.end() ? "" : it->second;
 }
 
+namespace {
+bool has_private_reference(const Value &value) {
+  if (value.is_array()) {
+    for (const auto &child : value.as_array()) if (has_private_reference(child)) return true;
+  } else if (value.is_object()) {
+    for (const auto &[key, child] : value.as_object()) {
+      if (key == "audio_base64" || key == "voice_ref" || key == "reference_text" ||
+          key == "references" || key == "multi_reference_cond" || key == "artifacts" ||
+          key == "previous_takes" || key == "previous_takes_file" || key == "vq_codes") return true;
+      if (has_private_reference(child)) return true;
+    }
+  }
+  return false;
+}
+
+bool is_reference_request_path(const std::string &path) {
+  return path == "/v1/tasks/run" || path == "/v1/tasks/batch" || path == "/v1/tasks/stream" ||
+         path == "/v1/audio/speech";
+}
+}
+
 void log_request_body_if_enabled(const ServerConfig &config,
                                  const HttpRequest &request) {
   if (!config.log_request_body || !engine::debug::log_enabled()) {
@@ -784,6 +821,30 @@ void log_request_body_if_enabled(const ServerConfig &config,
     return;
   }
   if (!request.body.empty() && is_json_content_type(request)) {
+    if (is_reference_request_path(request.path)) {
+      // Avoid decoding and copying common large payloads solely to decide
+      // whether to log them. A false positive only suppresses debug logging.
+      for (const auto *key : {"\"audio_base64\"", "\"voice_ref\"", "\"reference_text\"", "\"references\"",
+                              "\"multi_reference_cond\"", "\"artifacts\"", "\"previous_takes\"",
+                              "\"previous_takes_file\"", "\"vq_codes\""}) {
+        if (request.body.find(key) != std::string::npos) {
+          engine::debug::log_message("[REQUEST_BODY_SKIPPED] reference-bearing JSON");
+          return;
+        }
+      }
+      // Parse the uncommon case too: JSON keys may use Unicode escapes, and
+      // malformed bodies may contain private values even if they cannot run.
+      try {
+        const auto json = engine::io::json::parse(request.body);
+        if (has_private_reference(json)) {
+          engine::debug::log_message("[REQUEST_BODY_SKIPPED] reference-bearing JSON");
+          return;
+        }
+      } catch (const std::runtime_error &) {
+        engine::debug::log_message("[REQUEST_BODY_SKIPPED] invalid JSON");
+        return;
+      }
+    }
     engine::debug::log_message("[REQUEST_BODY] " + request.method + " " +
                                request.path);
     engine::debug::log_message(request.body);

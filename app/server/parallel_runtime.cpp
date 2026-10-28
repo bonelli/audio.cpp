@@ -2116,6 +2116,9 @@ HttpResponse ParallelServerState::handle_generic_run(const std::string & body_te
     auto request_lease = bind_request(model, busy_timeout_ms);
     const auto * request_json = body.find("request");
     const auto & effective_json = request_json != nullptr ? *request_json : body;
+    if (ambiguous_drama3_inline_reference(effective_json, model.config)) {
+        return error_response(400, "provide only one of audio input or voice_ref for reference encoding", "invalid_request_error");
+    }
     std::optional<engine::runtime::AudioBuffer> inline_audio;
     if (const auto * encoded = effective_json.find("audio_base64")) {
         if (effective_json.find("audio") != nullptr) {
@@ -2139,6 +2142,7 @@ HttpResponse ParallelServerState::handle_generic_run(const std::string & body_te
     auto parsed_request = minitts::cli::build_request_from_json(effective_json, request_base_);
     if (inline_audio) {
         parsed_request.audio_input = std::move(*inline_audio);
+        parsed_request.audio_input_is_inline = true;
     }
     const auto request = apply_default_request_options(
         model.config.default_request_options,

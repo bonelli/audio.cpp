@@ -1,8 +1,11 @@
 // Run the actual server handlers with tiny controlled loaders. Barriers force
 // lifecycle overlaps without GPU timing, sleeps in production, or large models.
 #include "parallel_runtime.h"
+#include "server_protocol.h"
+#include "../../app/common/base64.h"
 #include "engine/framework/audio/wav_writer.h"
 #include "engine/framework/runtime/errors.h"
+#include "engine/framework/debug/trace.h"
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
@@ -77,6 +80,9 @@ struct Control {
     std::atomic<int> loads{0}, destructions{0}, runs{0}, finishes{0};
     std::atomic<int> sessions{0}, clones{0}, final_text{0};
     std::atomic<int> last_device{-1};
+    std::atomic<size_t> last_audio_samples{0};
+    std::atomic<bool> last_text_missing{false};
+    std::atomic<bool> last_audio_inline{false};
     std::atomic<bool> fail_load{false}, null_session{false}, fail_prepare{false}, fail_run{false}, fail_clone{false}, reject_run{false};
     std::atomic<bool> premature_model_destruction{false}, live_input{false}, no_text{false}; std::optional<rt::Transcript> live_text;
 };
@@ -104,6 +110,9 @@ public:
     rt::TaskResult run(const rt::TaskRequest & request) override {
         control_->run.wait();
         ++control_->runs;
+        control_->last_audio_samples = request.audio_input ? request.audio_input->samples.size() : 0;
+        control_->last_text_missing = !request.text_input;
+        control_->last_audio_inline = request.audio_input_is_inline;
         if (control_->fail_run) { throw std::runtime_error("controlled inference failure"); }
         if (control_->reject_run) { throw rt::InvalidRequestError("controlled request rejection"); }
         if (task_.task == rt::VoiceTaskKind::Asr && !request.audio_input) {
@@ -212,6 +221,7 @@ public:
 namespace minitts::server {
 class ServerRuntimeTestAccess {
 public:
+    static void enable_request_body_log(ParallelServerState & state) { state.config_.log_request_body = true; }
     static void registry(ParallelServerState & state, const std::shared_ptr<Loader> & loader) {
         state.registry_factory_ = [loader] {
             rt::ModelRegistry registry; registry.register_loader(loader); return registry;
@@ -1164,6 +1174,96 @@ void generic_task_stream_sse(int count) {
     require(active() == 0, "unstarted task stream leaked its slot");
 }
 
+void inline_audio_request_logging() {
+    Fixture f(1);
+    auto control = f.add("logging");
+    Access::enable_request_body_log(*f.state);
+    const auto log = f.root / "logging-test.txt";
+    engine::debug::configure_logging({true, log.string()});
+    const auto wav = srv::encode_pcm16_wav(rt::AudioBuffer{44100, 1, {0.1f, -0.1f}});
+    const auto encoded = minitts::app::base64_encode(wav);
+    const auto response = post(*f.state, "/v1/tasks/run", "{\"model\":\"logging\",\"request\":{\"audio_base64\":\"" + encoded +
+        "\",\"options\":{\"reference_text\":\"SENSITIVE_TEXT\"}}}");
+    success(response);
+    (void)post(*f.state, "/v1/tasks/run", "{\"model\":\"logging\",\"audio_\\u0062ase64\":\"SENSITIVE_AUDIO_ESCAPED\"}");
+    for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
+         {"/v1/tasks/run", "{\"model\":\"logging\",\"request\":{\"options\":{\"references\":\"SENSITIVE_CODES\"}}}"},
+         {"/v1/tasks/batch", "{\"model\":\"logging\",\"requests\":[{\"options\":{\"multi_reference_cond\":\"SENSITIVE_MULTI\"}}]}"},
+         {"/v1/tasks/stream", "{\"model\":\"logging\",\"request\":{\"artifacts\":[{\"payload\":\"SENSITIVE_ARTIFACT\"}]}}"},
+         {"/v1/audio/speech", "{\"model\":\"logging\",\"voice_\\u0072ef\":\"SENSITIVE_VOICE\"}"},
+         {"/v1/audio/speech", "{\"model\":\"logging\",\"reference_text\":\"SENSITIVE_REFERENCE\"}"}}) {
+        try { (void)post(*f.state, path, body); } catch (const std::exception &) {}
+    }
+    try { (void)post(*f.state, "/v1/tasks/run", "{\"request\":{\"reference_text\":\"SENSITIVE_BROKEN\""); }
+    catch (const std::runtime_error &) {}
+    success(post(*f.state, "/v1/tasks/run", "{\"model\":\"logging\",\"text\":\"ORDINARY_BODY\"}"));
+    engine::debug::reset_logging();
+    std::ifstream input(log);
+    const std::string content{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    require(control->runs >= 2 && content.find(encoded) == std::string::npos && content.find("SENSITIVE_") == std::string::npos &&
+            content.find("ORDINARY_BODY") != std::string::npos,
+            "inline or invalid task body was logged, or ordinary body logging changed");
+}
+
+void generic_inline_audio_transport() {
+    Fixture f(1);
+    auto offline = f.add("inline-offline", "offline");
+    auto streaming = f.add("inline-stream", "streaming");
+    constexpr size_t samples = 5 * 1024 * 1024 / 2 + 1;
+    const auto wav = srv::encode_pcm16_wav(rt::AudioBuffer{44100, 1, std::vector<float>(samples, 0.1f)});
+    require(wav.size() > 5 * 1024 * 1024, "fixture must exceed 5 MiB");
+    const auto encoded = minitts::app::base64_encode(wav);
+    for (const auto & [model, control] : std::vector<std::pair<std::string, std::shared_ptr<Control>>>{
+             {"inline-offline", offline}, {"inline-stream", streaming}}) {
+        const auto body = "{\"model\":" + quote(model) +
+            ",\"request\":{\"audio_base64\":\"" + encoded +
+            "\",\"options\":{\"encode_reference_only\":true,\"reference_text\":\"example\"}}}";
+        const auto response = post(*f.state, "/v1/tasks/run", body);
+        success(response);
+        require(control->last_audio_samples == samples && control->last_text_missing && control->last_audio_inline,
+                "inline audio or omitted text did not reach the session");
+    }
+    const auto wav_path = f.root / "path-input.wav";
+    { std::ofstream file(wav_path, std::ios::binary); file.write(reinterpret_cast<const char *>(wav.data()), wav.size()); }
+    const auto from_path = post(*f.state, "/v1/tasks/run", "{\"model\":\"inline-offline\",\"request\":{\"audio\":" +
+        quote(wav_path.generic_string()) + ",\"text\":\"ordinary\"}}");
+    success(from_path);
+    require(offline->last_audio_samples == samples && !offline->last_audio_inline, "path audio was marked inline");
+    const auto calls = offline->runs.load();
+    for (const std::string audio : {"%%%%", "Z2FyYmFnZQ=="}) {
+        const auto response = post(*f.state, "/v1/tasks/run",
+            "{\"model\":\"inline-offline\",\"request\":{\"audio_base64\":\"" + audio + "\"}}");
+        require(response.status == 400 && response.body.find(audio) == std::string::npos,
+                "malformed inline audio should be rejected without echoing payload");
+    }
+    const auto ambiguous = post(*f.state, "/v1/tasks/run",
+        "{\"model\":\"inline-offline\",\"request\":{\"audio\":\"missing.wav\",\"audio_base64\":\"Z2FyYmFnZQ==\"}}");
+    require(ambiguous.status == 400 && offline->runs == calls, "invalid audio reached the session");
+    auto drama = f.add("drama-ambiguous", "offline");
+    Access::model(*f.state, "drama-ambiguous").config.family = "fish_drama3";
+    const auto voice_conflict = post(*f.state, "/v1/tasks/run",
+        "{\"model\":\"drama-ambiguous\",\"request\":{\"audio_base64\":\"AAAA\",\"voice_ref\":\"private-missing.wav\",\"options\":{\"encode_reference_only\":true}}}");
+    require(voice_conflict.status == 400 && voice_conflict.body.find("only one") != std::string::npos &&
+            voice_conflict.body.find("private-missing.wav") == std::string::npos &&
+            voice_conflict.body.find("AAAA") == std::string::npos && drama->loads == 0,
+            "parallel handler did not reject ambiguous reference before opening it");
+    const auto invalid_option = post(*f.state, "/v1/tasks/run",
+        "{\"model\":\"drama-ambiguous\",\"request\":{\"audio_base64\":\"AAAA\",\"voice_ref\":\"private-missing.wav\",\"options\":{\"encode_reference_only\":\"SENSITIVE_BAD_BOOLEAN\"}}}");
+    require(invalid_option.status == 400 && invalid_option.body.find("encode_reference_only") != std::string::npos &&
+            invalid_option.body.find("private-missing.wav") == std::string::npos &&
+            invalid_option.body.find("SENSITIVE_BAD_BOOLEAN") == std::string::npos && drama->loads == 0,
+            "parallel handler leaked or accepted invalid encode-only option");
+    srv::ServerModelConfig config;
+    config.family = "fish_drama3";
+    config.default_request_options["encode_reference_only"] = "true";
+    const auto base = parse("{\"audio_base64\":\"AAAA\",\"voice_ref\":\"missing.wav\"}");
+    require(srv::ambiguous_drama3_inline_reference(base, config), "configured encode-only default ignored");
+    const auto ordinary = parse("{\"audio_base64\":\"AAAA\",\"voice_ref\":\"missing.wav\",\"options\":{\"encode_reference_only\":false}}");
+    require(!srv::ambiguous_drama3_inline_reference(ordinary, config), "ordinary override changed");
+    config.family = "other";
+    require(!srv::ambiguous_drama3_inline_reference(base, config), "other family semantics changed");
+}
+
 int main(int argc, char ** argv) {
     try {
         engine::io::json::enable_serialized_json_parsing();
@@ -1185,6 +1285,8 @@ int main(int argc, char ** argv) {
         unsupported_capacity_preserves_registration();
         dynamic_capacity_changes_use_parallel_lifecycle();
         generic_batch_single_slot_and_invalid_input();
+        inline_audio_request_logging();
+        generic_inline_audio_transport();
         for (int count : {1, 2, 4}) {
             older_work_before_management(count, false);
             older_work_before_management(count, true);

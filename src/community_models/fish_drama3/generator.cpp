@@ -1,4 +1,5 @@
 #include "engine/community_models/fish_drama3/generator.h"
+#include "encode_graph_guard.h"
 
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/runtime/errors.h"
@@ -189,6 +190,14 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
 }
 
 Drama3Generator::~Drama3Generator() = default;
+
+codecs::FishDacCodes Drama3Generator::encode_inline_reference(const runtime::AudioBuffer & audio) {
+    constexpr int64_t chunk_samples = 65536;
+    detail::EncodeGraphGuard<codecs::FishDacCodecRuntime> guard{*codec_};
+    auto result = codec_->encode_codes(audio, chunk_samples);
+    validate_drama3_codes(result, assets_->tower.codebook_size);
+    return result;
+}
 
 codecs::FishDacCodes Drama3Generator::encode_reference(const runtime::AudioBuffer & audio) {
     if (cached_reference_audio_ && cached_reference_audio_->sample_rate == audio.sample_rate &&

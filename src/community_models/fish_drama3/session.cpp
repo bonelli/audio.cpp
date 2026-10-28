@@ -1,4 +1,5 @@
 #include "engine/community_models/fish_drama3/session.h"
+#include "reference_input.h"
 
 #include "engine/framework/audio/wav_reader.h"
 #include "engine/framework/debug/trace.h"
@@ -130,7 +131,15 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     if (request.voice) effective.voice = request.voice;
     for (const auto & option : request.options) effective.options[option.first] = option.second;
     effective.input_artifacts = request.input_artifacts;
-    if (!effective.text_input) throw runtime::InvalidRequestError("Drama 3 requires input text");
+    bool encode_only = false;
+    try {
+        if (const auto prepare = runtime::find_option(effective.options, {"encode_reference_only"})) {
+            encode_only = runtime::parse_bool_option(*prepare, "encode_reference_only");
+        }
+    } catch (const std::runtime_error & error) {
+        throw runtime::InvalidRequestError(error.what());
+    }
+    const auto inline_reference = detail::select_inline_reference(request, effective, encode_only);
     Drama3Sampling sampling;
     std::optional<uint32_t> seed;
     try {
@@ -146,6 +155,9 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     }
     sampling.seed = seed.value_or(runtime::random_u32_seed());
     std::vector<Drama3Take> references;
+    if (inline_reference) {
+        references.push_back({*inline_reference->transcript, generator_->encode_inline_reference(*inline_reference->audio)});
+    }
     if (effective.voice && effective.voice->speaker && effective.voice->speaker->cached_voice_id &&
         !effective.voice->speaker->audio) {
         throw runtime::InvalidRequestError("Drama 3 requires reference audio or a reference descriptor with VQ codes");
@@ -163,8 +175,7 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     if (task_.task == runtime::VoiceTaskKind::VoiceCloning && references.empty()) {
         throw runtime::InvalidRequestError("Drama 3 cloning requires at least one reference");
     }
-    if (const auto prepare = runtime::find_option(effective.options, {"encode_reference_only"});
-        prepare && runtime::parse_bool_option(*prepare, "encode_reference_only")) {
+    if (encode_only) {
         if (references.empty()) throw runtime::InvalidRequestError("Reference preparation requires reference audio or codes");
         if (task_.mode == runtime::RunMode::Streaming) generator_->warm_streaming_codec(references.front().codes);
         runtime::TaskResult result;

@@ -88,6 +88,8 @@ public:
     FishDacCodecRuntime & operator=(const FishDacCodecRuntime &) = delete;
 
     FishDacCodes encode_codes(const runtime::AudioBuffer & audio);
+    // Request-local override; does not change the runtime's configured mode.
+    FishDacCodes encode_codes(const runtime::AudioBuffer & audio, int64_t encoder_chunk_samples);
     FishDacLatents encode_latents(const runtime::AudioBuffer & audio);
     runtime::AudioBuffer decode_codes(const FishDacCodes & codes);
     // Decode consecutive frames with persistent causal attention/convolution state.

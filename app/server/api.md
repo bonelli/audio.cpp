@@ -440,6 +440,31 @@ HTTP 400. The existing `max_request_body_bytes` limit applies to the entire
 JSON body, including Base64 expansion. The WAV must meet the model's input
 sample-rate and channel requirements. Inline audio is supported on this endpoint;
 batch and stream endpoints retain their existing input formats.
+Even with request-body logging enabled, task and speech requests carrying
+reference data or artifacts are not logged, and malformed JSON bodies on those
+routes are skipped as a precaution.
+
+Drama 3 can prepare a reusable reference without generating speech:
+
+```json
+{
+  "model": "drama3",
+  "request": {
+    "audio_base64": "<Base64-encoded WAV>",
+    "options": {"encode_reference_only": true, "reference_text": "<reference transcript>"}
+  }
+}
+```
+
+Here `reference_text` must be non-empty and `text` for speech generation is not
+needed. Do not combine the inline reference with `voice_ref`. The result contains
+an artifact named `drama3_reference_0` with metadata schema
+`drama3_reference_v1`. Its Base64-decoded payload is a JSON object containing
+`text` and `vq_codes`. To reuse the reference, serialize an array containing that
+decoded object as the `options.references` JSON string in a Drama 3 synthesis
+request. Do not pass it
+as a generic input artifact: Drama 3 interprets those as generated history.
+The existing server-local `voice_ref` and multi-reference inputs remain available.
 
 Generic framework request route. The `request` object uses the same JSON fields as the `audiocpp_cli` request sequence format.
 

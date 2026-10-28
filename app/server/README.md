@@ -475,7 +475,7 @@ paths, and model options.
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| Config `log_request_body` | `false` | Log JSON request bodies only when logging is also enabled with `--log` or `--log-file`. Audio payload bytes are not printed. |
+| Config `log_request_body` | `false` | Log JSON request bodies only when logging is also enabled with `--log` or `--log-file`. Task and speech bodies containing reference data or artifacts, and malformed JSON on those routes, are skipped. Binary audio payloads are not printed. |
 | Config `max_request_body_bytes` | `2147483648` | Maximum buffered HTTP body in bytes (2 GiB), before routing. It covers JSON and audio uploads, including base64 expansion. |
 | Flag `--load-progress 0\|1` | `0` | With logging enabled, emit model-load progress keys. This is not generation progress and can be inaccurate for multi-component packages. |
 

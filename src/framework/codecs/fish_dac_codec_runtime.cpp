@@ -1,4 +1,5 @@
 #include "engine/framework/codecs/fish_dac_codec_runtime.h"
+#include "fish_dac_encoder_chunks.h"
 
 #include "engine/framework/audio/conversion.h"
 #include "engine/framework/audio/resampling.h"
@@ -1827,24 +1828,27 @@ public:
         if (component_ == nullptr || component_->impl_ == nullptr || component_->impl_->weights == nullptr) {
             throw std::runtime_error("Fish DAC codec runtime requires a loaded codec component");
         }
-        if (encoder_chunk_samples_ < 0 || encoder_chunk_samples_ % kEncoderConvHop != 0) {
-            throw std::invalid_argument("Fish DAC codec encoder_chunk_samples must be 0 or a positive multiple of 512 samples");
-        }
-        if (encoder_chunk_samples_ > 0 &&
-            (component_->impl_->config.frame_length % kEncoderConvHop != 0 ||
-             !encoder_is_chunkable(*component_->impl_->weights))) {
-            throw std::invalid_argument("Fish DAC codec chunked encoding requires hop-aligned frames and a convolution stack with no intermediate transformers");
-        }
+        validate_encoder_chunk_samples(encoder_chunk_samples_);
+    }
+
+    void validate_encoder_chunk_samples(int64_t chunk) const {
+        detail::validate_encoder_chunk_samples(chunk, chunk == 0 ||
+            (component_->impl_->config.frame_length % kEncoderConvHop == 0 &&
+             encoder_is_chunkable(*component_->impl_->weights)));
     }
 
     FishDacCodes encode_codes(const runtime::AudioBuffer & audio) {
+        return encode_codes(audio, encoder_chunk_samples_);
+    }
+
+    FishDacCodes encode_codes(const runtime::AudioBuffer & audio, int64_t chunk) {
+        validate_encoder_chunk_samples(chunk);
         const auto & config = component_->impl_->config;
         auto mono = prepare_codec_mono(audio, config.sample_rate);
         const int64_t samples = ceil_div(static_cast<int64_t>(mono.size()), config.frame_length) * config.frame_length;
         const int64_t frames = ceil_div(static_cast<int64_t>(mono.size()), config.frame_length);
-        if (encoder_chunk_samples_ > 0 && samples > encoder_chunk_samples_ &&
-            samples - encoder_chunk_samples_ > kEncodeContextSamples) {
-            return encode_codes_chunked(std::move(mono), samples, frames, encoder_chunk_samples_);
+        if (chunk > 0 && samples > chunk && samples - chunk > kEncodeContextSamples) {
+            return encode_codes_chunked(std::move(mono), samples, frames, chunk);
         }
         if (encode_graph_ == nullptr || !encode_graph_->matches(samples, frames, execution_.backend(), threads_, false)) {
             encode_graph_.reset();
@@ -2086,6 +2090,10 @@ FishDacCodecRuntime::~FishDacCodecRuntime() = default;
 
 FishDacCodes FishDacCodecRuntime::encode_codes(const runtime::AudioBuffer & audio) {
     return impl_->encode_codes(audio);
+}
+
+FishDacCodes FishDacCodecRuntime::encode_codes(const runtime::AudioBuffer & audio, int64_t chunk) {
+    return impl_->encode_codes(audio, chunk);
 }
 
 FishDacLatents FishDacCodecRuntime::encode_latents(const runtime::AudioBuffer & audio) {

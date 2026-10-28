@@ -173,6 +173,8 @@ struct TaskRequest {
     /// reading either cannot silently see the other half-formed. The `*_list`
     /// option types the spec schema already declares are carried here.
     std::unordered_map<std::string, std::vector<std::string>> option_arrays;
+    // True when the HTTP generic run endpoint decoded audio_base64 in this request.
+    bool audio_input_is_inline = false;
 };
 
 struct AudioPreparationContract {
