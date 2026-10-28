@@ -100,6 +100,12 @@ public:
     // timeout_ms is positive and either the current holder has already overrun (fail
     // fast, no wait) or the wait itself times out.
     Lock acquire(int timeout_ms, std::string_view label) {
+        // Observation only; does not change admission or timeout semantics.
+        struct Waiting {
+            std::atomic<int> & count;
+            explicit Waiting(std::atomic<int> & value) : count(value) { count.fetch_add(1, std::memory_order_relaxed); }
+            ~Waiting() { count.fetch_sub(1, std::memory_order_relaxed); }
+        } waiting(waiting_);
         std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
         if (timeout_ms <= 0) {
             lock.lock();  // guard disabled: original unbounded wait
@@ -139,9 +145,12 @@ public:
         return Lock(*this, std::move(lock));
     }
 
+    int waiting() const noexcept { return waiting_.load(std::memory_order_relaxed); }
+
 private:
     std::timed_mutex mutex_;
     std::atomic<std::int64_t> busy_since_ms_{0};
+    std::atomic<int> waiting_{0};
 };
 
 }  // namespace minitts::server

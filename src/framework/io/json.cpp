@@ -432,7 +432,8 @@ std::optional<Value> inspect_root_routing(std::string_view text) {
                 Value::Object selected;
                 int options_count = 0;
                 bool encoding_flag_seen = false;
-                bool first_option_explicitly_disables_encoding = false;
+                int options_with_false_encoding = 0;
+                bool ambiguous_encoding_flag = false;
                 for (const cJSON * child = source->child; child; child = child->next) {
                     if (!child->string) return std::nullopt;
                     const std::string_view key(child->string);
@@ -440,19 +441,20 @@ std::optional<Value> inspect_root_routing(std::string_view text) {
                         ++options_count;
                         if (!cJSON_IsObject(child)) continue;
                         Value::Object options;
+                        bool flag_seen_in_option = false;
                         for (const cJSON * opt = child->child; opt; opt = opt->next) {
                             if (opt->string && std::string_view(opt->string) == "encode_reference_only") {
-                                if (encoding_flag_seen) return std::nullopt;
+                                if (flag_seen_in_option) return std::nullopt;
+                                flag_seen_in_option = true;
                                 encoding_flag_seen = true;
-                                if (options_count == 1) {
-                                    if (cJSON_IsFalse(opt) || (cJSON_IsNumber(opt) && opt->valuedouble == 0))
-                                        first_option_explicitly_disables_encoding = true;
-                                    if (cJSON_IsString(opt) && opt->valuestring) {
-                                        const std::string_view flag(opt->valuestring);
-                                        first_option_explicitly_disables_encoding =
-                                            flag == "false" || flag == "0" || flag == "no" || flag == "off";
-                                    }
+                                bool explicitly_false = cJSON_IsFalse(opt) ||
+                                    (cJSON_IsNumber(opt) && opt->valuedouble == 0);
+                                if (cJSON_IsString(opt) && opt->valuestring) {
+                                    const std::string_view flag(opt->valuestring);
+                                    explicitly_false = flag == "false" || flag == "0" || flag == "no" || flag == "off";
                                 }
+                                if (explicitly_false) ++options_with_false_encoding;
+                                else ambiguous_encoding_flag = true;
                                 options.emplace("encode_reference_only", convert_cjson(opt));
                             }
                         }
@@ -465,8 +467,14 @@ std::optional<Value> inspect_root_routing(std::string_view text) {
                         else selected.emplace(std::string(key), Value::make_bool(true));
                     }
                 }
-                if (options_count > 1 && encoding_flag_seen && !first_option_explicitly_disables_encoding)
-                    return std::nullopt;
+                if (options_count > 1 && encoding_flag_seen) {
+                    if (ambiguous_encoding_flag) return std::nullopt;
+                    // A flag in only some colliding option objects cannot
+                    // override an encoder-only model or voice-preset default
+                    // with confidence. Retain that default for the probe.
+                    if (options_with_false_encoding != options_count)
+                        selected["options"] = Value::make_object({});
+                }
                 return Value::make_object(std::move(selected));
             };
             auto selected = minimal_request(request ? request : root);

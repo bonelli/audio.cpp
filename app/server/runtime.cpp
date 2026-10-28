@@ -758,16 +758,20 @@ ServerState::LoadedModel & ServerState::require_model(const Value & body) {
     return *models_.at(it->second);
 }
 
-engine::runtime::TaskRequest ServerState::build_speech_request(const LoadedModel & model, const Value & body) const {
+engine::runtime::TaskRequest ServerState::build_speech_request(const LoadedModel & model, const Value & body,
+                                                              bool defer_drama3_validation) const {
     std::shared_lock<std::shared_mutex> metadata_lock(model.metadata_mutex);
-    validate_drama3_system_prompt(body, model.config, true);
-    return preserve_request_scoped_drama3_system_prompt(minitts::server::build_speech_request(
+    if (!defer_drama3_validation) validate_drama3_system_prompt(body, model.config, true);
+    auto request = minitts::server::build_speech_request(
         body,
         SpeechRequestContext{
             request_base_, config_.voice_dir, model.voice_presets, model.default_voice_preset,
             model.accepts_reference_text, model.accepts_speed,
             model.accepts_speaking_rate,
-            model.config.default_request_options}), body, model.config);
+            model.config.default_request_options});
+    if (!defer_drama3_validation)
+        request = preserve_request_scoped_drama3_system_prompt(std::move(request), body, model.config);
+    return request;
 }
 
 struct ServerState::TimedTaskResult {
@@ -799,15 +803,22 @@ BusyGuard::Lock ServerState::acquire_model_run(
 ServerState::TimedTaskResult ServerState::run_model(
     LoadedModel & model,
     const engine::runtime::TaskRequest & request,
-    std::optional<int> busy_timeout_ms) {
+    std::optional<int> busy_timeout_ms,
+    std::optional<Drama3PromptAdmission> admission) {
     BusyGuard::Lock lock = acquire_model_run(model, busy_timeout_ms);
+    std::optional<engine::runtime::TaskRequest> sanitized;
+    if (admission && validate_drama3_prompt_admission(*admission, model.config, request)) {
+        sanitized = request;
+        sanitized->options.erase("system_prompt");
+    }
+    const auto & effective_request = sanitized ? *sanitized : request;
     ensure_model_loaded_locked(model);
     if (model.offline == nullptr) {
         throw std::runtime_error("configured model does not provide offline execution: " + model.config.id);
     }
     const auto started = Clock::now();
-    model.session->prepare(engine::runtime::build_preparation_request(request));
-    auto result = model.offline->run(request);
+    model.session->prepare(engine::runtime::build_preparation_request(effective_request));
+    auto result = model.offline->run(effective_request);
     // Mark activity at completion too: idle unload must measure from when the
     // request finished, not when it started, or a long inference would look idle
     // (and be unloaded) the moment it returns.
@@ -824,14 +835,21 @@ ServerState::TimedTaskResult ServerState::run_streaming_model_impl(
     const engine::runtime::TaskRequest & request,
     const minitts::app::AudioChunkStream * audio,
     const std::function<void(const engine::runtime::StreamEvent &)> & event_sink,
-    std::optional<int> busy_timeout_ms) {
+    std::optional<int> busy_timeout_ms,
+    std::optional<Drama3PromptAdmission> admission) {
     BusyGuard::Lock lock = acquire_model_run(model, busy_timeout_ms);
+    std::optional<engine::runtime::TaskRequest> sanitized;
+    if (admission && validate_drama3_prompt_admission(*admission, model.config, request)) {
+        sanitized = request;
+        sanitized->options.erase("system_prompt");
+    }
+    const auto & effective_request = sanitized ? *sanitized : request;
     ensure_model_loaded_locked(model);
     if (model.streaming == nullptr) {
         throw std::runtime_error("configured model does not provide streaming execution: " + model.config.id);
     }
     const auto started = Clock::now();
-    model.session->prepare(engine::runtime::build_preparation_request(request));
+    model.session->prepare(engine::runtime::build_preparation_request(effective_request));
     TimedTaskResult timed_result;
     const bool diarization = model.task.task == engine::runtime::VoiceTaskKind::Diarization;
     const auto sink = [&](const engine::runtime::StreamEvent & event) {
@@ -844,8 +862,8 @@ ServerState::TimedTaskResult ServerState::run_streaming_model_impl(
         }
     };
     auto result = audio != nullptr
-        ? minitts::app::run_streaming_task(*model.streaming, request, sink, *audio)
-        : minitts::app::run_streaming_task(*model.streaming, request, sink);
+        ? minitts::app::run_streaming_task(*model.streaming, effective_request, sink, *audio)
+        : minitts::app::run_streaming_task(*model.streaming, effective_request, sink);
     timed_result.result = std::move(result);
     timed_result.wall_ms = elapsed_ms(started);
     if (!timed_result.ttft_ms.has_value() &&
@@ -863,8 +881,9 @@ ServerState::TimedTaskResult ServerState::run_streaming_model(
     LoadedModel & model,
     const engine::runtime::TaskRequest & request,
     const std::function<void(const engine::runtime::StreamEvent &)> & event_sink,
-    std::optional<int> busy_timeout_ms) {
-    return run_streaming_model_impl(model, request, nullptr, event_sink, busy_timeout_ms);
+    std::optional<int> busy_timeout_ms,
+    std::optional<Drama3PromptAdmission> admission) {
+    return run_streaming_model_impl(model, request, nullptr, event_sink, busy_timeout_ms, admission);
 }
 
 ServerState::TimedTaskResult ServerState::run_streaming_model_from(
@@ -884,18 +903,15 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
             return model.config;
         }, false, false, true);
     auto & model = require_model(body);
-    {
-        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
-        validate_drama3_system_prompt_wire(body_text, body, model.config, false, false, true);
-    }
-    const auto request = build_speech_request(model, body);
+    const auto admission = inspect_drama3_prompt_admission(body_text, body, body, false);
+    const auto request = build_speech_request(model, body, true);
     if (body.find("stream_format") != nullptr || bool_field(body, "stream", false)) {
-        return handle_speech_stream(model, request, body);
+        return handle_speech_stream(model, request, body, admission);
     }
     const auto busy_timeout_ms = parse_busy_timeout_override(body);
     const auto timed_result = model_run_mode(model) == engine::runtime::RunMode::Streaming
-        ? run_streaming_model(model, request, {}, busy_timeout_ms)
-        : run_model(model, request, busy_timeout_ms);
+        ? run_streaming_model(model, request, {}, busy_timeout_ms, admission)
+        : run_model(model, request, busy_timeout_ms, admission);
     const auto & audio = select_audio_output(timed_result.result);
     const auto wav = encode_pcm16_wav(audio);
     const auto response_format = engine::io::json::optional_string(body, "response_format", "wav");
@@ -915,7 +931,8 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
 HttpResponse ServerState::handle_speech_stream(
     LoadedModel & model,
     const engine::runtime::TaskRequest & request,
-    const Value & body) {
+    const Value & body,
+    const Drama3PromptAdmission &admission) {
     if (model_run_mode(model) != engine::runtime::RunMode::Streaming) {
         throw std::runtime_error("speech streaming requires a model configured with mode=streaming");
     }
@@ -930,7 +947,7 @@ HttpResponse ServerState::handle_speech_stream(
 
     const auto busy_timeout_ms = parse_busy_timeout_override(body);
     LoadedModel * model_ptr = &model;
-    auto stream_body = [this, model_ptr, request, busy_timeout_ms](HttpStreamWriter & writer) {
+    auto stream_body = [this, model_ptr, request, busy_timeout_ms, admission](HttpStreamWriter & writer) {
         bool wrote_audio = false;
         const auto timed_result = run_streaming_model(
             *model_ptr,
@@ -953,7 +970,7 @@ HttpResponse ServerState::handle_speech_stream(
                     wrote_audio = true;
                 }
             },
-            busy_timeout_ms);
+            busy_timeout_ms, admission);
         if (!wrote_audio) {
             throw std::runtime_error("streaming speech model produced no audio delta events");
         }
@@ -967,7 +984,7 @@ HttpResponse ServerState::handle_speech_stream(
     if (stream_format == "sse") {
         return sse_response(std::move(stream_body));
     }
-    return chunked_audio_response([this, model_ptr, request, busy_timeout_ms](HttpStreamWriter & writer) {
+    return chunked_audio_response([this, model_ptr, request, busy_timeout_ms, admission](HttpStreamWriter & writer) {
         bool wrote_audio = false;
         (void)run_streaming_model(
             *model_ptr,
@@ -984,7 +1001,7 @@ HttpResponse ServerState::handle_speech_stream(
                     wrote_audio = true;
                 }
             },
-            busy_timeout_ms);
+            busy_timeout_ms, admission);
         if (!wrote_audio) {
             throw std::runtime_error("streaming speech model produced no audio delta events");
         }
@@ -2026,16 +2043,9 @@ HttpResponse ServerState::handle_generic_run(const std::string & body_text) {
             return model.config;
         }, false, true);
     auto & model = require_model(body);
-    {
-        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
-        validate_drama3_system_prompt_wire(body_text, body, model.config, false, true);
-    }
     const auto * request_json = body.find("request");
     const auto & effective_json = request_json != nullptr ? *request_json : body;
-    {
-        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
-        validate_drama3_system_prompt(effective_json, model.config);
-    }
+    const auto admission = inspect_drama3_prompt_admission(body_text, body, effective_json, true);
     if (ambiguous_drama3_inline_reference(effective_json, model.config)) {
         return error_response(400, "provide only one of audio input or voice_ref for reference encoding", "invalid_request_error");
     }
@@ -2070,14 +2080,10 @@ HttpResponse ServerState::handle_generic_run(const std::string & body_text) {
             std::move(parsed_request),
             effective_json,
             model.accepts_language));
-    {
-        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
-        request = preserve_request_scoped_drama3_system_prompt(std::move(request), effective_json, model.config);
-    }
     const auto busy_timeout_ms = parse_busy_timeout_override(body);
     const auto timed_result = model_run_mode(model) == engine::runtime::RunMode::Streaming
-        ? run_streaming_model(model, request, {}, busy_timeout_ms)
-        : run_model(model, request, busy_timeout_ms);
+        ? run_streaming_model(model, request, {}, busy_timeout_ms, admission)
+        : run_model(model, request, busy_timeout_ms, admission);
     return json_response(task_result_json(timed_result.result, timed_result.wall_ms));
 }
 
@@ -2199,27 +2205,16 @@ HttpResponse ServerState::handle_generic_stream(const std::string & body_text) {
             return model.config;
         }, false, true);
     auto & model = require_model(body);
-    {
-        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
-        validate_drama3_system_prompt_wire(body_text, body, model.config, false, true);
-    }
     const bool sse = task_stream_sse_requested(body);
     const auto * request_json = body.find("request");
     const auto & effective_json = request_json != nullptr ? *request_json : body;
-    {
-        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
-        validate_drama3_system_prompt(effective_json, model.config);
-    }
+    const auto admission = inspect_drama3_prompt_admission(body_text, body, effective_json, true);
     auto request = apply_default_request_options(
         model.config.default_request_options,
         drop_unsupported_language_option(
             minitts::cli::build_request_from_json(effective_json, request_base_),
             effective_json,
             model.accepts_language));
-    {
-        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
-        request = preserve_request_scoped_drama3_system_prompt(std::move(request), effective_json, model.config);
-    }
     if (sse) {
         const auto busy_timeout_ms = parse_busy_timeout_override(body);
         bool diarization;
@@ -2232,7 +2227,7 @@ HttpResponse ServerState::handle_generic_stream(const std::string & body_text) {
         // response puts in "events", and the result follows as the object it
         // puts under "result". The model lock is taken inside the stream, as on
         // the other streamed routes, so a busy model is an error event here.
-        return sse_response([this, model_ptr, request = std::move(request), busy_timeout_ms, diarization](
+        return sse_response([this, model_ptr, request = std::move(request), busy_timeout_ms, diarization, admission](
                                 HttpStreamWriter & writer) {
             const auto timed_result = run_streaming_model(
                 *model_ptr,
@@ -2240,7 +2235,7 @@ HttpResponse ServerState::handle_generic_stream(const std::string & body_text) {
                 [&](const engine::runtime::StreamEvent & event) {
                     write_sse(writer, task_stream_event_line(stream_event_json(event, diarization)));
                 },
-                busy_timeout_ms);
+                busy_timeout_ms, admission);
             const bool silent_diarization = diarization && !timed_result.ttft_ms.has_value();
             write_sse(writer, task_stream_done_line(
                                   silent_diarization
@@ -2256,7 +2251,7 @@ HttpResponse ServerState::handle_generic_stream(const std::string & body_text) {
         [&](const engine::runtime::StreamEvent & event) {
             events.push_back(event);
         },
-        parse_busy_timeout_override(body));
+        parse_busy_timeout_override(body), admission);
     std::ostringstream out;
     std::shared_lock<std::shared_mutex> metadata_lock(model.metadata_mutex);
     const bool diarization = model.task.task == engine::runtime::VoiceTaskKind::Diarization;

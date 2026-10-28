@@ -124,6 +124,44 @@ void validate_drama3_system_prompt(const Value &request, const ServerModelConfig
   }
 }
 
+Drama3PromptAdmission inspect_drama3_prompt_admission(
+    const std::string &body_text, const Value &body, const Value &request, bool nested_request) {
+  Drama3PromptAdmission admission;
+  if (const auto *options = request.find("options"); options && options->is_object()) {
+    if (const auto *value = options->find("system_prompt")) {
+      admission.explicit_option = true;
+      admission.invalid_type = !value->is_string();
+    }
+  }
+  if (body_text.find("\\u0000") != std::string::npos || body_text.find('\0') != std::string::npos) {
+    const auto shape = nested_request && body.find("request") != nullptr ?
+        SystemPromptRequestShape::NestedRequest : SystemPromptRequestShape::Root;
+    try { SystemPromptWireScan(body_text, shape).validate(); }
+    catch (const engine::runtime::InvalidRequestError &error) {
+      // Keep only fixed generic diagnostics, never request bytes.
+      const std::string_view message(error.what());
+      if (message == "system_prompt key contains NUL" || message == "options.system_prompt cannot contain NUL")
+        admission.wire_error = std::string(message);
+    }
+  }
+  return admission;
+}
+
+bool validate_drama3_prompt_admission(
+    const Drama3PromptAdmission &admission, const ServerModelConfig &model,
+    const engine::runtime::TaskRequest &request) {
+  if (model.family != "fish_drama3") return false;
+  if (const auto encode = engine::runtime::find_option(request.options, {"encode_reference_only"})) {
+    try { if (engine::runtime::parse_bool_option(*encode, "encode_reference_only")) return false; }
+    catch (const std::runtime_error &) {
+      throw engine::runtime::InvalidRequestError("encode_reference_only must be true/false, yes/no, on/off, or 1/0");
+    }
+  }
+  if (!admission.wire_error.empty()) throw engine::runtime::InvalidRequestError(admission.wire_error);
+  if (admission.invalid_type) throw engine::runtime::InvalidRequestError("options.system_prompt must be a string");
+  return !admission.explicit_option && request.options.count("system_prompt") != 0;
+}
+
 engine::runtime::TaskRequest preserve_request_scoped_drama3_system_prompt(
     engine::runtime::TaskRequest request, const Value &request_json,
     const ServerModelConfig &model) {
@@ -899,6 +937,9 @@ bool has_private_reference(const Value &value) {
     for (const auto &child : value.as_array()) if (has_private_reference(child)) return true;
   } else if (value.is_object()) {
     for (const auto &[key, child] : value.as_object()) {
+      // A malformed or double-serialized options value can itself contain a
+      // private request. Do not interpret its contents or log the body.
+      if (key == "options" && !child.is_object()) return true;
       if (key == "system_prompt" || key == "audio_base64" || key == "voice_ref" || key == "reference_text" ||
           key == "references" || key == "multi_reference_cond" || key == "artifacts" ||
           key == "previous_takes" || key == "previous_takes_file" || key == "vq_codes") return true;

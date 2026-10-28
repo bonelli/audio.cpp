@@ -979,12 +979,12 @@ HttpResponse ParallelServerState::handle_speech(const std::string & body_text) {
             return model.config;
         }, false, false, true);
     auto & model = require_model(body);
+    const auto busy_timeout_ms = parse_busy_timeout_override(body);
+    auto request_lease = bind_request(model, busy_timeout_ms);
     {
         std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
         validate_drama3_system_prompt_wire(body_text, body, model.config, false, false, true);
     }
-    const auto busy_timeout_ms = parse_busy_timeout_override(body);
-    auto request_lease = bind_request(model, busy_timeout_ms);
     const auto request = build_speech_request(model, body);
     if (body.find("stream_format") != nullptr || bool_field(body, "stream", false)) {
         return handle_speech_stream(model, request, body, request_lease);
@@ -2144,12 +2144,12 @@ HttpResponse ParallelServerState::handle_generic_run(const std::string & body_te
             return model.config;
         }, false, true);
     auto & model = require_model(body);
+    const auto busy_timeout_ms = parse_busy_timeout_override(body);
+    auto request_lease = bind_request(model, busy_timeout_ms);
     {
         std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
         validate_drama3_system_prompt_wire(body_text, body, model.config, false, true);
     }
-    const auto busy_timeout_ms = parse_busy_timeout_override(body);
-    auto request_lease = bind_request(model, busy_timeout_ms);
     const auto * request_json = body.find("request");
     const auto & effective_json = request_json != nullptr ? *request_json : body;
     {
@@ -2322,13 +2322,13 @@ HttpResponse ParallelServerState::handle_generic_stream(const std::string & body
             return model.config;
         }, false, true);
     auto & model = require_model(body);
+    const bool sse = task_stream_sse_requested(body);
+    const auto busy_timeout_ms = parse_busy_timeout_override(body);
+    auto request_lease = bind_request(model, busy_timeout_ms);
     {
         std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
         validate_drama3_system_prompt_wire(body_text, body, model.config, false, true);
     }
-    const bool sse = task_stream_sse_requested(body);
-    const auto busy_timeout_ms = parse_busy_timeout_override(body);
-    auto request_lease = bind_request(model, busy_timeout_ms);
     const auto * request_json = body.find("request");
     const auto & effective_json = request_json != nullptr ? *request_json : body;
     {

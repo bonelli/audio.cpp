@@ -51,6 +51,7 @@ public:
     LiveIngestLimits live_ingest_limits(const HttpRequest & request) const override;
 
 private:
+    friend class ServerRuntimeTestAccess;
     friend struct RequestDispatcher;
 
     struct LoadedModel {
@@ -142,26 +143,30 @@ private:
     LoadedModel & require_model(const engine::io::json::Value & body);
     engine::runtime::TaskRequest build_speech_request(
         const LoadedModel & model,
-        const engine::io::json::Value & body) const;
+        const engine::io::json::Value & body,
+        bool defer_drama3_validation = false) const;
     struct TimedTaskResult;
     // `busy_timeout_ms` on each of these is the per-request override parsed from the
     // request body; nullopt means "use the model's configured ceiling".
     TimedTaskResult run_model(
         LoadedModel & model,
         const engine::runtime::TaskRequest & request,
-        std::optional<int> busy_timeout_ms = std::nullopt);
+        std::optional<int> busy_timeout_ms = std::nullopt,
+        std::optional<Drama3PromptAdmission> admission = std::nullopt);
     TimedTaskResult run_streaming_model(
         LoadedModel & model,
         const engine::runtime::TaskRequest & request,
         const std::function<void(const engine::runtime::StreamEvent &)> & event_sink = {},
-        std::optional<int> busy_timeout_ms = std::nullopt);
+        std::optional<int> busy_timeout_ms = std::nullopt,
+        std::optional<Drama3PromptAdmission> admission = std::nullopt);
     // Shared body of the two entry points above/below; `audio` selects the source.
     TimedTaskResult run_streaming_model_impl(
         LoadedModel & model,
         const engine::runtime::TaskRequest & request,
         const minitts::app::AudioChunkStream * audio,
         const std::function<void(const engine::runtime::StreamEvent &)> & event_sink,
-        std::optional<int> busy_timeout_ms);
+        std::optional<int> busy_timeout_ms,
+        std::optional<Drama3PromptAdmission> admission = std::nullopt);
     // Same as run_streaming_model, but pulls audio from `audio` instead of
     // `request.audio_input`, so the samples are never fully materialized.
     TimedTaskResult run_streaming_model_from(
@@ -174,7 +179,8 @@ private:
     HttpResponse handle_speech_stream(
         LoadedModel & model,
         const engine::runtime::TaskRequest & request,
-        const engine::io::json::Value & body);
+        const engine::io::json::Value & body,
+        const Drama3PromptAdmission &admission);
     HttpResponse handle_speech_live(const HttpRequest & request);
     // detail selects the /v1/audio/transcriptions/details response, which adds the
     // segment, speaker-turn and word arrays the plain route drops.

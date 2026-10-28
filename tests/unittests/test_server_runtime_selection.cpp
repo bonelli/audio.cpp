@@ -4,15 +4,126 @@
 #include "server_protocol.h"
 #include "../../app/common/base64.h"
 #include "engine/framework/io/json.h"
+#include "engine/framework/runtime/errors.h"
 #include "engine/framework/debug/trace.h"
 
 #include <filesystem>
 #include <fstream>
+#include <chrono>
+#include <future>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
+#include <thread>
+
+namespace minitts::server {
+class ServerRuntimeTestAccess {
+public:
+    static auto & model(ServerState &state, const std::string &id) {
+        return *state.models_.at(state.model_index_.at(id));
+    }
+    static BusyGuard::Lock hold(ServerState &state, const std::string &id) {
+        return model(state, id).busy.acquire(0, id);
+    }
+    static int waiting(ServerState &state, const std::string &id) {
+        return model(state, id).busy.waiting();
+    }
+    static void replace_family(ServerState &state, const std::string &id) {
+        auto & item = model(state, id);
+        std::unique_lock<std::shared_mutex> lock(item.metadata_mutex);
+        item.config.family = "fish_drama3";
+    }
+    static bool loaded(ServerState &state, const std::string &id) {
+        return model(state, id).loaded.load();
+    }
+};
+}
+
+namespace {
+class CaptureWriter final : public minitts::server::HttpStreamWriter {
+public:
+    void write(std::string_view value) override { data.append(value); }
+    std::string data;
+};
+
+void serial_wire_validation_follows_reconfiguration() {
+    struct Case { const char *path; const char *mode; bool sse; };
+    for (const Case item : {
+             Case{"/v1/tasks/run", "offline", false},
+             Case{"/v1/tasks/stream", "streaming", false},
+             Case{"/v1/tasks/stream", "streaming", true},
+             Case{"/v1/audio/speech", "offline", false},
+             Case{"/v1/audio/speech", "streaming", true}}) {
+        minitts::server::ServerConfig config;
+        config.backend = engine::core::BackendType::Cpu;
+        config.busy_timeout_ms = 0;
+        config.ui_enabled = false;
+        minitts::server::ServerModelConfig model;
+        model.id = "race";
+        model.family = "old_family";
+        model.task = "tts";
+        model.mode = item.mode;
+        model.lazy = true;
+        model.path = std::filesystem::temp_directory_path() / "audiocpp-serial-race-never-load";
+        config.models.push_back(model);
+        minitts::server::ServerState state(config, std::filesystem::current_path());
+        using Access = minitts::server::ServerRuntimeTestAccess;
+        std::optional<minitts::server::BusyGuard::Lock> held;
+        held.emplace(Access::hold(state, "race"));
+        minitts::server::HttpRequest request;
+        request.method = "POST";
+        request.path = item.path;
+        request.headers["content-type"] = "application/json";
+        const std::string options = R"("options":{"system_prompt":"PRIVATE_PROMPT\u0000TAIL"})";
+        if (request.path == "/v1/audio/speech") {
+            request.body = "{\"model\":\"race\",\"input\":\"hello\"," + options +
+                (item.sse ? ",\"stream_format\":\"sse\"}" : "}");
+        } else {
+            request.body = "{\"model\":\"race\",\"request\":{\"text\":\"hello\"," + options + "}" +
+                (item.sse ? ",\"stream_format\":\"sse\"}" : "}");
+        }
+        struct Outcome { int status = 0; bool streamed = false; std::string body, error, emitted; };
+        auto pending = std::async(std::launch::async, [&] {
+            Outcome out;
+            const auto response = state.handle(request);
+            out.status = response.status;
+            out.body = response.body;
+            out.streamed = static_cast<bool>(response.stream_body);
+            if (response.stream_body) {
+                CaptureWriter writer;
+                try { response.stream_body(writer); }
+                catch (const engine::runtime::InvalidRequestError &error) { out.error = error.what(); }
+                out.emitted = std::move(writer.data);
+            }
+            return out;
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (Access::waiting(state, "race") == 0 && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        const bool waiting = Access::waiting(state, "race") > 0;
+        Access::replace_family(state, "race");
+        held.reset();
+        const auto result = pending.get();
+        if (!waiting) throw std::runtime_error("serial request did not wait behind BusyGuard");
+        if (item.sse) {
+            if (result.status != 200 || !result.streamed || !result.emitted.empty() ||
+                result.error.find("cannot contain NUL") == std::string::npos ||
+                result.error.find("PRIVATE_PROMPT") != std::string::npos)
+                throw std::runtime_error("serial SSE did not reject after reconfiguration");
+        } else if (result.status != 400 || result.streamed ||
+                   result.body.find("cannot contain NUL") == std::string::npos ||
+                   result.body.find("PRIVATE_PROMPT") != std::string::npos) {
+            throw std::runtime_error("serial request did not reject after reconfiguration");
+        }
+        if (Access::loaded(state, "race") || Access::waiting(state, "race") != 0)
+            throw std::runtime_error("serial invalid request loaded a model or retained a waiter");
+    }
+}
+}
 
 int main() {
     try {
+        serial_wire_validation_follows_reconfiguration();
         minitts::server::ServerConfig config;
         config.backend = engine::core::BackendType::Cpu;
         config.ui_management = true;
@@ -240,8 +351,14 @@ int main() {
                  {"/v1/audio/speech", "{\"model\":\"task\",\"input\":\"hello\",\"options\":{\"system_prompt\":\"SENSITIVE_BROKEN_PROMPT\""},
                  {"/not-a-route", "{\"options\":{\"system_prompt\":\"SENSITIVE_WRONG_ROUTE\"}}"},
                  {"/not-a-route", "{\"options\":{\"system_\\u0070rompt\":\"SENSITIVE_WRONG_ESCAPED\"}}"},
+                 {"/v1/tasks/run", R"({"model":"task","options":"{\"system_prompt\":\"SENSITIVE_DOUBLE_SERIALIZED\"}"})"},
+                 {"/not-a-route", R"({"opt\u0069ons":"{\"system_\\u0070rompt\":\"SENSITIVE_DOUBLE_ESCAPED\"}"})"},
+                 {"/not-a-route", R"({"options":null,"text":"SENSITIVE_NULL_OPTIONS"})"},
+                 {"/not-a-route", R"({"options":["SENSITIVE_ARRAY_OPTIONS"]})"},
+                 {"/not-a-route", R"({"options":false,"text":"SENSITIVE_BOOL_OPTIONS"})"},
                  {"/not-a-route", "{\"system_\\u0070rompt\":\"SENSITIVE_WRONG_MALFORMED\""},
                  {"/not-a-route", "{\"text\":\"ORDINARY_WRONG_ROUTE\"}"},
+                 {"/not-a-route", R"({"options":{"seed":5},"text":"ORDINARY_OBJECT_OPTIONS"})"},
                  {"/v1/audio/speech", "{\"model\":\"task\",\"voice_\\u0072ef\":\"SENSITIVE_AUDIO\"}"},
                  {"/v1/tasks/run", "{\"artifacts\":\"SENSITIVE_ARTIFACT\""},
                  {"/v1/tasks/run", "{\"model\":\"task\",\"text\":\"ORDINARY_SERIAL\"}"}}) {
@@ -259,7 +376,8 @@ int main() {
             const std::string content{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
             std::filesystem::remove(log);
             if (content.find("SENSITIVE_") != std::string::npos || content.find("ORDINARY_SERIAL") == std::string::npos ||
-                content.find("ORDINARY_WRONG_ROUTE") == std::string::npos)
+                content.find("ORDINARY_WRONG_ROUTE") == std::string::npos ||
+                content.find("ORDINARY_OBJECT_OPTIONS") == std::string::npos)
                 throw std::runtime_error("serial handler logged reference data or skipped an ordinary request");
         }
         for (const auto & [bad, message] : std::vector<std::pair<std::string, std::string>>{

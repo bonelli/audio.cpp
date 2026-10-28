@@ -143,6 +143,36 @@ int main() {
             catch (const std::runtime_error &) { original_error = true; }
             expect(original_error, "other model parse classification changed");
             model.family = "fish_drama3";
+            for (const auto & raw : {
+                R"({"model":"test","request":{"options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{"encode_reference_only":false}}})",
+                R"({"model":"test","request":{"options\u0000suffix":{"encode_reference_only":false},"options":{"system_prompt":"x\u0000y"}}})"
+            }) {
+                bool rejected = false;
+                try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, true); }
+                catch (const engine::runtime::InvalidRequestError &error) {
+                    rejected = true;
+                    expect(std::string(error.what()).find("x") == std::string::npos,
+                           "NUL collision error echoed input");
+                }
+                expect(rejected, "false encoder flag in ambiguous options masked system_prompt NUL");
+                model.default_request_options["encode_reference_only"] = "true";
+                bool original_error = false;
+                try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) {}
+                catch (const std::runtime_error &) { original_error = true; }
+                expect(original_error, "uncertain encoder default changed parse classification");
+                model.default_request_options.clear();
+            }
+            for (const auto & raw : {
+                R"({"model":"test","request":{"options":{"system_prompt":"x\u0000y"},"options\u0000suffix":{"encode_reference_only":true}}})",
+                R"({"model":"test","request":{"options\u0000suffix":{"encode_reference_only":true},"options":{"system_prompt":"x\u0000y"}}})"
+            }) {
+                bool original_error = false;
+                try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, true); }
+                catch (const engine::runtime::InvalidRequestError &) {}
+                catch (const std::runtime_error &) { original_error = true; }
+                expect(original_error, "ambiguous true encoder flag changed parse classification");
+            }
             const auto unrelated = R"({"model":"test","request":{"options":{"different":"one","different\u0000extra":"two"}}})";
             original_error = false;
             try { (void) minitts::server::parse_task_body_guarded(unrelated, lookup, false, true); }

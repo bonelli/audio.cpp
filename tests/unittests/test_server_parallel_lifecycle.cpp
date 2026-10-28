@@ -1196,6 +1196,8 @@ void inline_audio_request_logging() {
     for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
          {"/v1/tasks/run", "{\"model\":\"logging\",\"request\":{\"options\":{\"references\":\"SENSITIVE_CODES\"}}}"},
          {"/v1/tasks/run", "{\"model\":\"logging\",\"request\":{\"options\":{\"system_prompt\":\"SENSITIVE_PROMPT\"}}}"},
+         {"/v1/tasks/run", R"({"model":"logging","options":"{\"system_prompt\":\"SENSITIVE_DOUBLE_SERIALIZED\"}"})"},
+         {"/not-a-route", R"({"opt\u0069ons":"{\"system_\\u0070rompt\":\"SENSITIVE_DOUBLE_ESCAPED\"}"})"},
          {"/v1/tasks/stream", "{\"model\":\"logging\",\"request\":{\"options\":{\"system_\\u0070rompt\":\"SENSITIVE_ESCAPED_PROMPT\"}}}"},
          {"/v1/audio/speech", "{\"model\":\"logging\",\"options\":{\"system_prompt\":\"SENSITIVE_BROKEN_PROMPT\""},
          {"/not-a-route", "{\"options\":{\"system_prompt\":\"SENSITIVE_WRONG_ROUTE\"}}"},
@@ -1210,11 +1212,12 @@ void inline_audio_request_logging() {
     try { (void)post(*f.state, "/v1/tasks/run", "{\"request\":{\"reference_text\":\"SENSITIVE_BROKEN\""); }
     catch (const std::runtime_error &) {}
     success(post(*f.state, "/v1/tasks/run", "{\"model\":\"logging\",\"text\":\"ORDINARY_BODY\"}"));
+    success(post(*f.state, "/v1/tasks/run", "{\"model\":\"logging\",\"options\":{\"seed\":5},\"text\":\"ORDINARY_OBJECT_OPTIONS\"}"));
     engine::debug::reset_logging();
     std::ifstream input(log);
     const std::string content{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     require(control->runs >= 2 && content.find(encoded) == std::string::npos && content.find("SENSITIVE_") == std::string::npos &&
-            content.find("ORDINARY_BODY") != std::string::npos,
+            content.find("ORDINARY_BODY") != std::string::npos && content.find("ORDINARY_OBJECT_OPTIONS") != std::string::npos,
             "inline or invalid task body was logged, or ordinary body logging changed");
 }
 
@@ -1376,6 +1379,47 @@ void transcription_does_not_forward_drama_system_prompt() {
     speech(",\"options\":{\"system_prompt\":\"explicit instruction\"}", "explicit instruction");
 }
 
+void system_prompt_wire_validation_follows_reconfiguration() {
+    for (const std::string path : {"/v1/tasks/run", "/v1/tasks/stream", "/v1/audio/speech"}) {
+        Fixture f(1);
+        const auto original = f.add("shared");
+        const auto replacement = f.asset("replacement");
+        success(run(*f.state, "shared"));
+        original->run.arm();
+        auto active = std::async(std::launch::async, [&] { return run(*f.state, "shared"); });
+        const bool active_started = observe([&] { return Access::slots(*f.state, "shared").active == 1; });
+        auto manager = std::async(std::launch::async, [&] {
+            return post(*f.state, "/v1/models/load", "{\"id\":\"shared\",\"path\":" +
+                quote((f.root / "replacement").generic_string()) +
+                ",\"family\":\"fish_drama3\",\"task\":\"tts\",\"slots\":1}");
+        });
+        const bool manager_queued = f.queued("shared", 1, true);
+        auto request = std::async(std::launch::async, [&] {
+            const std::string options = R"("options":{"system_prompt":"PRIVATE_VALUE\u0000TAIL"})";
+            const auto body = path == "/v1/audio/speech"
+                ? "{\"model\":\"shared\",\"input\":\"hello\"," + options + "}"
+                : "{\"model\":\"shared\",\"request\":{\"text\":\"hello\"," + options + "}}";
+            return post(*f.state, path, body);
+        });
+        const bool request_queued = f.queued("shared", 1);
+        original->run.release();
+        const auto active_result = active.get();
+        const auto manager_result = manager.get();
+        const auto result = request.get();
+        require(active_started && manager_queued && request_queued,
+                "reconfiguration and later request did not queue in order");
+        success(active_result);
+        success(manager_result);
+        require(result.status == 400 && result.body.find("cannot contain NUL") != std::string::npos &&
+                result.body.find("PRIVATE_VALUE") == std::string::npos,
+                "request did not validate against the replacement model");
+        require(replacement->runs == 0, "invalid system prompt reached replacement inference");
+        const auto slots = Access::slots(*f.state, "shared");
+        require(slots.active == 0 && slots.waiting_requests == 0 && slots.waiting_management == 0,
+                "request or management lease was not released");
+    }
+}
+
 int main(int argc, char ** argv) {
     try {
         engine::io::json::enable_serialized_json_parsing();
@@ -1400,6 +1444,7 @@ int main(int argc, char ** argv) {
         inline_audio_request_logging();
         generic_inline_audio_transport();
         transcription_does_not_forward_drama_system_prompt();
+        system_prompt_wire_validation_follows_reconfiguration();
         for (int count : {1, 2, 4}) {
             older_work_before_management(count, false);
             older_work_before_management(count, true);

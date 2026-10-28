@@ -70,6 +70,17 @@ void validate_drama3_system_prompt(const engine::io::json::Value &request,
 bool is_drama3_reference_only(const engine::io::json::Value &request,
                               const ServerModelConfig &model,
                               bool speech_route = false);
+struct Drama3PromptAdmission {
+  bool explicit_option = false;
+  bool invalid_type = false;
+  std::string wire_error;
+};
+Drama3PromptAdmission inspect_drama3_prompt_admission(
+    const std::string &body_text, const engine::io::json::Value &body,
+    const engine::io::json::Value &request, bool nested_request);
+bool validate_drama3_prompt_admission(
+    const Drama3PromptAdmission &admission, const ServerModelConfig &model,
+    const engine::runtime::TaskRequest &request);
 void validate_drama3_system_prompt_wire(const std::string &body,
                                         const engine::io::json::Value &parsed,
                                         const ServerModelConfig &model,
