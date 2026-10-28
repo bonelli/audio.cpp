@@ -127,6 +127,7 @@ void print_help() {
         << "Endpoints:\n"
         << "  GET  /                           embedded WebUI (enabled by default with a config)\n"
         << "  GET  /health\n"
+        << "  GET  /ready\n"
         << "  GET  /v1/models\n"
         << "  GET  /v1/recipes\n"
         << "  POST /v1/models/load             available with --ui-management\n"

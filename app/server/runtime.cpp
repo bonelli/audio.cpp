@@ -2429,11 +2429,11 @@ std::string ServerState::get_allowed_origin(const HttpRequest & request) const {
 }
 
 void ServerState::LoadedModel::unload() {
+    loaded.store(false);
     offline = nullptr;
     streaming = nullptr;
     session.reset();
     model.reset();
-    loaded.store(false);
 }
 
 void ServerState::idle_unload_loop() {

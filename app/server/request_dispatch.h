@@ -8,6 +8,7 @@
 #include "engine/framework/runtime/errors.h"
 
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -17,6 +18,15 @@ namespace minitts::server {
 // Shares HTTP protocol dispatch without coupling the legacy and parallel
 // runtime state or lifecycle implementations.
 struct RequestDispatcher {
+  template <typename State>
+  static HttpResponse ready(const State &state) {
+    std::lock_guard<std::mutex> lock(state.models_mutex_);
+    if (state.models_.size() != 1 || !state.models_.front()->loaded.load()) {
+      return json_response("{\"status\":\"not_ready\"}", 503);
+    }
+    return json_response("{\"status\":\"ready\"}");
+  }
+
   template <typename State>
   static HttpResponse handle(State &state, const HttpRequest &request,
                              bool use_frontends,
@@ -46,6 +56,8 @@ struct RequestDispatcher {
         response.content_type = "image/x-icon";
       } else if (request.method == "GET" && request.path == "/health") {
         response = state.handle_health();
+      } else if (request.method == "GET" && request.path == "/ready") {
+        response = ready(state);
       } else if (request.method == "GET" && request.path == "/v1/models") {
         const auto include_session_options =
             query_param(request.query, "include_session_options");

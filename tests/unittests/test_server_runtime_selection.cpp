@@ -13,6 +13,15 @@ int main() {
         config.backend = engine::core::BackendType::Cpu;
         config.ui_management = true;
         minitts::server::ServerState state(config, std::filesystem::current_path());
+        minitts::server::HttpRequest ready;
+        ready.method = "GET";
+        ready.path = "/ready";
+        for (bool forwarded : {false, true}) {
+            const auto result = forwarded ? state.forward_to_core(ready) : state.handle(ready);
+            if (result.status != 503) {
+                throw std::runtime_error("empty legacy server reported ready");
+            }
+        }
         for (const std::string value : {"1", "2", "null", "false", "\"4\""}) {
             minitts::server::HttpRequest request;
             request.method = "POST";
@@ -74,6 +83,9 @@ int main() {
             live_config.models.push_back(model);
         }
         minitts::server::ServerState live(live_config, std::filesystem::current_path());
+        if (live.handle(ready).status != 503) {
+            throw std::runtime_error("unloaded legacy models reported ready");
+        }
         minitts::server::HttpRequest live_list;
         live_list.method = "GET";
         live_list.path = "/v1/models";

@@ -4,6 +4,49 @@
 #include <iostream>
 
 namespace {
+void test_semantic_and_acoustic_policy() {
+    using namespace engine::models::fish_drama3;
+    SamplerScratch scratch;
+    // EOS is rank 1: the semantic nucleus must include the crossing token,
+    // while the acoustic nucleus retains the reference exclusion rule.
+    const std::vector<float> logits{std::log(0.15F), std::log(0.80F), std::log(0.05F)};
+    bool saw_eos = false;
+    for (uint32_t seed = 0; seed < 256; ++seed) {
+        std::mt19937 semantic_rng(seed), acoustic_rng(seed), limited_rng(seed);
+        const auto semantic = sample(logits, 1.0F, 4097, 0.9F, semantic_rng, scratch, true);
+        const auto acoustic = sample(logits, 1.0F, acoustic_top_k(4097), 0.9F, acoustic_rng, scratch);
+        const auto limited = sample(logits, 1.0F, 1, 0.9F, limited_rng, scratch, true);
+        if (semantic == 0) saw_eos = true;
+        if (semantic == 2 || acoustic != 1 || limited != 1)
+            throw std::runtime_error("semantic/acoustic nucleus or explicit top-k policy disagrees");
+    }
+    if (!saw_eos || acoustic_top_k(4097) != 30 || acoustic_top_k(12) != 12 || acoustic_top_k(1) != 1)
+        throw std::runtime_error("semantic crossing or acoustic top-k cap failed");
+
+    // At an exact boundary, semantic sampling retains the next token too,
+    // unless the explicit top-k cap excludes it.
+    const std::vector<float> tied_logits(4, 0.0F);
+    bool saw_boundary_crossing = false;
+    for (uint32_t seed = 0; seed < 256; ++seed) {
+        std::mt19937 semantic_rng(seed), limited_rng(seed);
+        const auto semantic = sample(tied_logits, 1.0F, 4, 0.5F, semantic_rng, scratch, true);
+        const auto limited = sample(tied_logits, 1.0F, 2, 0.5F, limited_rng, scratch, true);
+        if (semantic == 2) saw_boundary_crossing = true;
+        if (semantic > 2 || limited > 1)
+            throw std::runtime_error("semantic boundary escaped explicit top-k");
+    }
+    if (!saw_boundary_crossing) throw std::runtime_error("exact boundary lost its crossing token");
+
+    // Both the semantic first draw and RAS retry retain the crossing token.
+    const std::vector<float> retry_logits{std::log(0.04F), std::log(0.94F), std::log(0.02F)};
+    saw_eos = false;
+    for (uint32_t seed = 0; seed < 512; ++seed) {
+        std::mt19937 random(seed);
+        if (sample(retry_logits, 1.0F, 30, 0.95F, random, scratch, true) == 0) saw_eos = true;
+    }
+    if (!saw_eos) throw std::runtime_error("RAS retry excluded crossing EOS");
+}
+
 int32_t original_sample(const std::vector<float> & logits, float temperature, int top_k,
                         float top_p, std::mt19937 & random) {
     std::vector<int32_t> order(logits.size());
@@ -112,6 +155,7 @@ int main(int argc, char ** argv) {
         if (backend != "cpu" && backend != "cuda" && backend != "vulkan") {
             throw std::runtime_error("sampler test backend must be cpu, cuda, or vulkan");
         }
+        test_semantic_and_acoustic_policy();
         test_device_top_p_boundary(backend == "cuda" ? engine::core::BackendType::Cuda
             : backend == "vulkan" ? engine::core::BackendType::Vulkan : engine::core::BackendType::Cpu);
         std::cout << "device_top_p_boundary_matches=true backend=" << backend << '\n';

@@ -42,7 +42,8 @@ struct SamplerScratch {
 };
 
 int32_t sample(const std::vector<float> & logits, float temperature, int top_k,
-               float top_p, std::mt19937 & random, SamplerScratch & scratch) {
+               float top_p, std::mt19937 & random, SamplerScratch & scratch,
+               bool retain_crossing = false) {
     if (logits.empty()) throw std::runtime_error("Drama 3 sampler has no logits");
     if (temperature == 0 || top_k == 1)
         return sampling::HfLogitsProcessor::argmax(logits.data(), logits.size(), "Drama 3");
@@ -75,12 +76,17 @@ int32_t sample(const std::vector<float> & logits, float temperature, int top_k,
     probabilities.assign(count, 0);
     double cumulative = 0;
     for (size_t rank = 0; rank < sorted; ++rank) {
+        const double previous = cumulative;
         cumulative += weights[order[rank]] / total;
-        if (rank > 0 && cumulative > top_p) break;
+        if (rank > 0 && (retain_crossing ? previous > top_p : cumulative > top_p)) break;
         probabilities[rank] = weights[order[rank]];
     }
     std::discrete_distribution<size_t> choice(probabilities.begin(), probabilities.end());
     return order[choice(random)];
+}
+
+int acoustic_top_k(int requested_top_k) {
+    return std::min(requested_top_k, 30);
 }
 
 std::vector<float> last_hidden(const std::vector<float> & values, int64_t width) {
@@ -377,8 +383,8 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         // Both drama3 (lm_head_token_ids) and drama3-small (lm_head_rows) return
         // compact [EOS, semantic 0..N-1] logits from the backbone.
         auto candidates = std::move(logits);
-        const int32_t first = sample(candidates, sampling.temperature, sampling.top_k, sampling.top_p, random, sampler_scratch);
-        const int32_t second = sample(candidates, 1.0F, 30, 0.95F, random, sampler_scratch);
+        const int32_t first = sample(candidates, sampling.temperature, sampling.top_k, sampling.top_p, random, sampler_scratch, true);
+        const int32_t second = sample(candidates, 1.0F, 30, 0.95F, random, sampler_scratch, true);
         const int32_t first_token = first == 0 ? assets_->eos : assets_->tower.semantic_begin + first - 1;
         const bool repeats = first != 0 && std::find(recent.begin(), recent.end(), first_token) != recent.end();
         const int32_t selected = repeats ? second : first;
@@ -392,13 +398,14 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         const auto sampling_before_tower = component_ms[5];
         const int64_t position = decoder->valid_steps() - 1;
         const auto & config = assets_->tower;
+        const int residual_top_k = acoustic_top_k(sampling.top_k);
         if (device_sampling_) {
             std::array<float, 9> uniforms{};
-            if (sampling.temperature != 0 && sampling.top_k != 1) {
+            if (sampling.temperature != 0 && residual_top_k != 1) {
                 for (auto & uniform : uniforms) uniform = static_cast<float>(std::generate_canonical<double, 53>(random));
             }
             next = tower_->run_frame(hidden, current, selected - 1, position,
-                sampling.temperature, sampling.top_k, sampling.top_p, uniforms);
+                sampling.temperature, residual_top_k, sampling.top_p, uniforms);
         } else {
             const auto shared_input = tower_->shared_input({current});
             auto tower_hidden = hidden;
@@ -409,7 +416,7 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
                 tower_hidden = tower_output.hidden;
                 if (layer >= config.shared_layers) {
                     component_started = ProfileClock::now();
-                    next[2 + book] = sample(tower_output.logits, sampling.temperature, sampling.top_k, sampling.top_p, random, sampler_scratch);
+                    next[2 + book] = sample(tower_output.logits, sampling.temperature, residual_top_k, sampling.top_p, random, sampler_scratch);
                     component_ms[5] += debug::elapsed_ms(component_started);
                 }
             }

@@ -24,6 +24,14 @@ refer to entries in your server config, with the task/mode required by the route
 
 Returns server readiness and the number of configured models.
 
+## `GET /ready`
+
+Returns HTTP 200 with `{"status":"ready"}` only when exactly one model is
+registered and its session is loaded. Returns HTTP 503 with
+`{"status":"not_ready"}` otherwise, including when multiple models are
+registered. This is a snapshot: it does not load models, prevent a later
+unload, or assert that an inference has succeeded.
+
 ```json
 {"status":"ok","backend":"cpu","models":1,"ui":true,"ui_management":false,"version":"dev","git":"1bbd8517","git_date":"2026-10-25"}
 ```

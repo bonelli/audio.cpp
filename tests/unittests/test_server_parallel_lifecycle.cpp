@@ -314,6 +314,36 @@ void per_model_device_selection() {
             "dynamic load accepted a negative model device: " + invalid.body);
 }
 
+void readiness_tracks_model_lifecycle() {
+    Fixture f(1);
+    srv::HttpRequest request; request.method = "GET"; request.path = "/ready";
+    auto ready = [&] { return f.state->handle(request).status; };
+    require(ready() == 503, "empty server reported ready");
+    auto first = f.add("first");
+    require(ready() == 503, "unloaded model reported ready");
+    first->load.arm();
+    auto loading = std::async(std::launch::async, [&] { return run(*f.state, "first"); });
+    require(observe([&] { return first->load.seen(); }), "model load did not start");
+    const bool loading_not_ready = ready() == 503;
+    first->load.release();
+    success(loading.get());
+    require(loading_not_ready && ready() == 200, "single loaded session did not report ready");
+    first->destroy.arm();
+    auto unloading = std::async(std::launch::async, [&] {
+        return post(*f.state, "/v1/models/unload", "{\"id\":\"first\"}");
+    });
+    require(observe([&] { return first->destroy.seen(); }), "model unload did not start");
+    const bool unloading_not_ready = ready() == 503;
+    first->destroy.release();
+    success(unloading.get());
+    require(unloading_not_ready && ready() == 503, "unloaded model reported ready");
+    success(run(*f.state, "first"));
+    f.add("second");
+    require(ready() == 503, "server with multiple registered models reported ready");
+    success(run(*f.state, "second"));
+    require(ready() == 503, "server with multiple loaded models reported ready");
+}
+
 void older_work_before_management(int count, bool reconfigure) {
     Fixture f(count); auto c = f.add("shared"); f.asset("replacement");
     success(run(*f.state, "shared"));
@@ -1149,6 +1179,7 @@ int main(int argc, char ** argv) {
         invalid_reconfiguration_preserves_live_state();
         registration_is_visible_while_loading();
         live_policy_does_not_hold_registry_lock();
+        readiness_tracks_model_lifecycle();
         concurrent_json_parsing();
         per_model_device_selection();
         unsupported_capacity_preserves_registration();
