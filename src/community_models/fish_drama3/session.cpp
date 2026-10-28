@@ -134,7 +134,6 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     std::optional<std::string> system_prompt;
     if (const auto it = request.options.find("system_prompt"); it != request.options.end()) {
         system_prompt = it->second;
-        validate_drama3_system_prompt(*system_prompt);
     }
     bool encode_only = false;
     try {
@@ -144,6 +143,7 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     } catch (const std::runtime_error & error) {
         throw runtime::InvalidRequestError(error.what());
     }
+    if (!encode_only && system_prompt) generator_->validate_system_prompt(*system_prompt);
     const auto inline_reference = detail::select_inline_reference(request, effective, encode_only);
     Drama3Sampling sampling;
     std::optional<uint32_t> seed;

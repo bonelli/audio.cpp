@@ -5,6 +5,7 @@
 #include "../../app/cli/request.h"
 
 #include "engine/framework/io/json.h"
+#include "engine/framework/runtime/errors.h"
 
 #include <filesystem>
 #include <iostream>
@@ -45,6 +46,118 @@ int main() {
     try {
         minitts::server::ServerModelConfig model;
         model.family = "fish_drama3";
+        const std::unordered_map<std::string, std::string> inherited{{"system_prompt", "old preset"}};
+        for (const auto & value : {std::optional<std::string>{}, std::optional<std::string>{""},
+                                   std::optional<std::string>{"caller"}}) {
+            const auto body = engine::io::json::parse(value ?
+                "{\"text\":\"hello\",\"options\":{\"system_prompt\":\"" + *value + "\"}}" :
+                "{\"text\":\"hello\"}");
+            auto request = minitts::cli::build_request_from_json(body, fs::current_path());
+            request = minitts::server::apply_default_request_options(inherited, std::move(request));
+            request = minitts::server::preserve_request_scoped_drama3_system_prompt(std::move(request), body, model);
+            expect(request.options.count("system_prompt") == (value ? 1u : 0u), "task inherited instruction");
+            if (value) expect(request.options.at("system_prompt") == *value, "task explicit instruction changed");
+        }
+        RuntimeVoicePreset legacy_preset;
+        legacy_preset.options = inherited;
+        const std::unordered_map<std::string, RuntimeVoicePreset> legacy_presets{{"legacy", legacy_preset}};
+        for (const auto & value : {std::optional<std::string>{}, std::optional<std::string>{""},
+                                   std::optional<std::string>{"caller"}}) {
+            const std::string raw = value ?
+                "{\"input\":\"hello\",\"voice\":\"legacy\",\"options\":{\"system_prompt\":\"" + *value + "\"}}" :
+                "{\"input\":\"hello\",\"voice\":\"legacy\"}";
+            const auto body = engine::io::json::parse(raw);
+            auto request = speech(legacy_presets, {}, inherited, raw);
+            request = minitts::server::preserve_request_scoped_drama3_system_prompt(std::move(request), body, model);
+            expect(request.options.count("system_prompt") == (value ? 1u : 0u), "speech inherited instruction");
+            if (value) expect(request.options.at("system_prompt") == *value, "speech explicit instruction changed");
+        }
+        {
+            const auto body = engine::io::json::parse("{\"text\":\"hello\"}");
+            auto request = minitts::cli::build_request_from_json(body, fs::current_path());
+            request = minitts::server::apply_default_request_options(inherited, std::move(request));
+            model.family = "another_family";
+            request = minitts::server::preserve_request_scoped_drama3_system_prompt(std::move(request), body, model);
+            expect(request.options.at("system_prompt") == "old preset", "other model default changed");
+            model.family = "fish_drama3";
+        }
+        {
+            const auto reference_request = engine::io::json::parse(
+                R"({"options":{"encode_reference_only":true,"system_prompt":123}})");
+            expect(minitts::server::is_drama3_reference_only(reference_request, model), "encode-only flag lost");
+            minitts::server::validate_drama3_system_prompt(reference_request, model);
+            const std::string raw = R"({"options":{"encode_reference_only":true,"system_prompt":"a\u0000b"}})";
+            minitts::server::validate_drama3_system_prompt_wire(raw, engine::io::json::parse(raw), model, false, false);
+            model.default_request_options["encode_reference_only"] = "true";
+            minitts::server::validate_drama3_system_prompt(
+                engine::io::json::parse(R"({"options":{"system_prompt":123}})"), model);
+            expect(!minitts::server::is_drama3_reference_only(
+                engine::io::json::parse(R"({"options":{"encode_reference_only":""}})"), model),
+                "empty encode override must mask the default");
+            expect(!minitts::server::is_drama3_reference_only(
+                engine::io::json::parse(R"({"options":{"encode_reference_only":0}})"), model),
+                "numeric encode override must preserve conversion");
+            expect(minitts::server::is_drama3_reference_only(
+                engine::io::json::parse(R"({"options":{"encode_reference_only":1,"references":{"nested":[1,2,3]}}})"), model),
+                "numeric encode flag or unrelated options changed");
+            bool invalid_flag = false;
+            try {
+                (void) minitts::server::is_drama3_reference_only(
+                    engine::io::json::parse(R"({"options":{"encode_reference_only":null}})"), model);
+            } catch (const engine::runtime::InvalidRequestError &) { invalid_flag = true; }
+            expect(invalid_flag, "null encode flag should retain prior conversion error");
+            model.default_request_options.clear();
+            model.voice_presets["encoder"].options["encode_reference_only"] = "true";
+            const auto speech_reference = engine::io::json::parse(R"({"voice":"encoder","options":{"system_prompt":123}})");
+            expect(minitts::server::is_drama3_reference_only(speech_reference, model, true), "speech encode preset lost");
+            minitts::server::validate_drama3_system_prompt(speech_reference, model, true);
+            expect(!minitts::server::is_drama3_reference_only(speech_reference, model), "task applied speech preset");
+            const auto override_request = engine::io::json::parse(
+                R"({"voice":"encoder","options":{"encode_reference_only":false,"system_prompt":123}})");
+            bool rejected = false;
+            try { minitts::server::validate_drama3_system_prompt(override_request, model, true); }
+            catch (const engine::runtime::InvalidRequestError &) { rejected = true; }
+            expect(rejected, "explicit synthesis override ignored");
+            model.voice_presets.clear();
+        }
+        {
+            const auto lookup = [&](const engine::io::json::Value &) { return std::optional{model}; };
+            for (const auto & raw : {
+                R"({"model":"test","request":{"options":{"system_prompt":"one","system_prompt\u0000extra":"two"}}})",
+                R"({"model":"test","request":{"options":{"system_prompt":"one"},"options\u0000extra":{}}})",
+                R"({"model":"test","request":{"options\u0000extra":{},"options":{"system_prompt":"one"}}})"
+            }) {
+                bool rejected = false;
+                try { (void) minitts::server::parse_task_body_guarded(raw, lookup, false, true); }
+                catch (const engine::runtime::InvalidRequestError &error) {
+                    rejected = true;
+                    expect(std::string(error.what()).find("one") == std::string::npos, "collision error echoed input");
+                }
+                expect(rejected, "ambiguous Drama3 prompt key not rejected");
+            }
+            const auto untouched = R"({"model":"test","request":{"options":{"system_prompt":"one","system_prompt\u0000extra":"two"}}})";
+            model.family = "another_family";
+            bool original_error = false;
+            try { (void) minitts::server::parse_task_body_guarded(untouched, lookup, false, true); }
+            catch (const engine::runtime::InvalidRequestError &) {}
+            catch (const std::runtime_error &) { original_error = true; }
+            expect(original_error, "other model parse classification changed");
+            model.family = "fish_drama3";
+            const auto unrelated = R"({"model":"test","request":{"options":{"different":"one","different\u0000extra":"two"}}})";
+            original_error = false;
+            try { (void) minitts::server::parse_task_body_guarded(unrelated, lookup, false, true); }
+            catch (const engine::runtime::InvalidRequestError &) {}
+            catch (const std::runtime_error &) { original_error = true; }
+            expect(original_error, "unrelated collision classification changed");
+            const auto encode = R"({"model":"test","request":{"options":{"encode_reference_only":true,"system_prompt":"one","system_prompt\u0000extra":"two"}}})";
+            original_error = false;
+            try { (void) minitts::server::parse_task_body_guarded(encode, lookup, false, true); }
+            catch (const engine::runtime::InvalidRequestError &) {}
+            catch (const std::runtime_error &) { original_error = true; }
+            expect(original_error, "encoder-only parse classification changed");
+            const auto valid = R"({"model":"test","request":{"options":{"system_prompt":"valid"}}})";
+            expect(minitts::server::parse_task_body_guarded(valid, lookup, false, true).is_object(), "valid request changed");
+        }
         for (const auto & raw : {"{}", "{\"options\":{\"system_prompt\":\"\"}}", "{\"options\":{\"system_prompt\":\"ordinary\"}}"}) {
             minitts::server::validate_drama3_system_prompt(engine::io::json::parse(raw), model);
         }
@@ -67,7 +180,7 @@ int main() {
                 {std::string("{\"options\":{\"system_prompt\":\"a") + '\0' + "b\"}}", false, false, true},
                 {std::string("\xef\xbb\xbf") + R"({"options":{"system_prompt":"a\u0000b"}})", false, false, true},
                 {R"({"request":{"options":{"system_\u0070rompt":"a\u0000b"}}})", false, true, true},
-                {R"({"requests":[{"options":{"system_prompt":"a\u0000b"}}]})", true, false, true},
+                {R"({"requests":[{"options":{"system_prompt":"a\u0000b"}}]})", true, false, false},
                 {R"({"options":{"system_prompt\u0000extra":"a"}})", false, false, true},
                 {R"({"options\u0000extra":{"system_prompt":"a"}})", false, false, true},
                 {R"({"options\u0000extra":{"different":"a"}})", false, false, false},

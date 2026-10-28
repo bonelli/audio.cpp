@@ -85,6 +85,15 @@ void validate_drama3_system_prompt(const std::string & text) {
     }
 }
 
+void validate_drama3_system_prompt(const std::string & text, const Drama3TextTokenizer & tokenizer) {
+    validate_drama3_system_prompt(text);
+    for (const auto id : tokenizer.encode(text)) {
+        if (tokenizer.is_control_token_id(id)) {
+            throw runtime::InvalidRequestError("Drama 3 system_prompt contains a reserved special token");
+        }
+    }
+}
+
 void validate_drama3_codes(const codecs::FishDacCodes & codes, int64_t size) {
     if (codes.codebooks != 10 || codes.frames <= 0 ||
         codes.codes.size() != static_cast<size_t>(codes.frames * codes.codebooks)) {
@@ -99,7 +108,7 @@ std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
     const Drama3TextTokenizer & tokenizer, const std::string & text,
     const std::vector<Drama3Take> & references, const std::vector<Drama3Take> & history,
     const std::optional<std::string> & system_prompt) {
-    if (system_prompt) validate_drama3_system_prompt(*system_prompt);
+    if (system_prompt) validate_drama3_system_prompt(*system_prompt, tokenizer);
     std::vector<Drama3Frame> frames;
     const auto append_text = [&](const std::string & segment) {
         for (const auto token : tokenizer.encode(segment)) {

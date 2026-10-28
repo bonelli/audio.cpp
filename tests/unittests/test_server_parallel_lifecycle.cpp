@@ -85,6 +85,8 @@ struct Control {
     std::atomic<bool> last_audio_inline{false};
     std::atomic<bool> fail_load{false}, null_session{false}, fail_prepare{false}, fail_run{false}, fail_clone{false}, reject_run{false};
     std::atomic<bool> premature_model_destruction{false}, live_input{false}, no_text{false}; std::optional<rt::Transcript> live_text;
+    std::mutex options_mutex;
+    std::unordered_map<std::string, std::string> last_options;
 };
 class Session final : public rt::IOfflineVoiceTaskSession,
                       public rt::IBatchedOfflineVoiceTaskSession,
@@ -110,6 +112,10 @@ public:
     rt::TaskResult run(const rt::TaskRequest & request) override {
         control_->run.wait();
         ++control_->runs;
+        {
+            std::lock_guard<std::mutex> lock(control_->options_mutex);
+            control_->last_options = request.options;
+        }
         control_->last_audio_samples = request.audio_input ? request.audio_input->samples.size() : 0;
         control_->last_text_missing = !request.text_input;
         control_->last_audio_inline = request.audio_input_is_inline;
@@ -184,6 +190,7 @@ class Loader final : public rt::IVoiceModelLoader {
 public:
     std::map<std::string, std::shared_ptr<Control>> controls;
     std::string family() const override { return "lifecycle_fixture"; }
+    std::vector<std::string> family_aliases() const override { return {"fish_drama3"}; }
     bool can_load(const rt::ModelLoadRequest &) const override { return true; }
     rt::ModelInspection inspect(const rt::ModelLoadRequest &) const override { return {}; }
     std::unique_ptr<rt::ILoadedVoiceModel> load(const rt::ModelLoadRequest & request) const override {
@@ -1251,7 +1258,6 @@ void generic_inline_audio_transport() {
         for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
             {"/v1/tasks/run", "{\"model\":\"drama-ambiguous\",\"request\":{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}}"},
             {"/v1/tasks/stream", "{\"model\":\"drama-ambiguous\",\"request\":{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}}"},
-            {"/v1/tasks/batch", "{\"model\":\"drama-ambiguous\",\"requests\":[{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}]}"},
             {"/v1/audio/speech", "{\"model\":\"drama-ambiguous\",\"input\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}"}}) {
             const auto result = post(*f.state, path, body);
             require(result.status == 400 && result.body.find("options.system_prompt must be a string") != std::string::npos &&
@@ -1262,12 +1268,27 @@ void generic_inline_audio_transport() {
     for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
         {"/v1/tasks/run", R"({"model":"drama-ambiguous","request":{"options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}}})"},
         {"/v1/tasks/stream", R"({"model":"drama-ambiguous","request":{"options":{"system_\u0070rompt":"SENSITIVE\u0000TRUNCATED"}}})"},
-        {"/v1/tasks/batch", R"({"model":"drama-ambiguous","requests":[{"options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}}]})"},
         {"/v1/audio/speech", R"({"model":"drama-ambiguous","input":"hi","options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}})"}}) {
         const auto result = post(*f.state, path, body);
         require(result.status == 400 && result.body.find("cannot contain NUL") != std::string::npos &&
                 result.body.find("SENSITIVE") == std::string::npos && drama->loads == 0,
                 "parallel system_prompt NUL rejection failed on " + path);
+    }
+    for (const auto & option_fields : {
+             R"("options":{"system_prompt":"normal","system_prompt\u0000extra":"private"})",
+             R"("options":{"system_prompt\u0000extra":"private","system_prompt":"normal"})",
+             R"("options":{"system_prompt":"normal"},"options\u0000extra":{"other":"private"})",
+             R"("options":{"encode_reference_only":false,"system_prompt":"normal"},"options\u0000extra":{"other":"private"})",
+             R"("options\u0000extra":{"other":"private"},"options":{"system_prompt":"normal"})"}) {
+        for (const auto & path : {"/v1/tasks/run", "/v1/tasks/stream", "/v1/audio/speech"}) {
+            const std::string fields = std::string(option_fields);
+            const std::string body = path == std::string("/v1/audio/speech") ?
+                "{\"model\":\"drama-ambiguous\",\"input\":\"hi\"," + fields + "}" :
+                "{\"model\":\"drama-ambiguous\",\"request\":{" + fields + "}}";
+            const auto result = post(*f.state, path, body);
+            require(result.status == 400 && result.body.find("private") == std::string::npos && drama->loads == 0,
+                    "parallel collision was not safely rejected");
+        }
     }
     for (const std::string path : {"/v1/tasks/run", "/v1/tasks/stream", "/v1/tasks/batch", "/v1/audio/speech"}) {
         std::string error;
@@ -1291,6 +1312,11 @@ void generic_inline_audio_transport() {
             invalid_option.body.find("private-missing.wav") == std::string::npos &&
             invalid_option.body.find("SENSITIVE_BAD_BOOLEAN") == std::string::npos && drama->loads == 0,
             "parallel handler leaked or accepted invalid encode-only option");
+    for (const std::string value : {R"({"private":"data"})", R"("a\u0000b")"}) {
+        const auto result = post(*f.state, "/v1/tasks/run", "{\"model\":\"drama-ambiguous\",\"request\":{\"audio_base64\":\"AAAA\",\"options\":{\"encode_reference_only\":true,\"system_prompt\":" + value + "}}}");
+        require(result.status == 400 && result.body.find("valid Base64-encoded WAV") != std::string::npos && drama->loads == 0,
+                "parallel reference-only request changed its validation");
+    }
     srv::ServerModelConfig config;
     config.family = "fish_drama3";
     config.default_request_options["encode_reference_only"] = "true";
@@ -1300,6 +1326,54 @@ void generic_inline_audio_transport() {
     require(!srv::ambiguous_drama3_inline_reference(ordinary, config), "ordinary override changed");
     config.family = "other";
     require(!srv::ambiguous_drama3_inline_reference(base, config), "other family semantics changed");
+}
+
+void transcription_does_not_forward_drama_system_prompt() {
+    Fixture f(1);
+    const auto drama = f.add("transcription-drama");
+    const auto other = f.add("transcription-other");
+    auto & drama_model = Access::model(*f.state, "transcription-drama");
+    drama_model.config.family = "fish_drama3";
+    drama_model.config.default_request_options["system_prompt"] = "default instruction";
+    Access::model(*f.state, "transcription-other").config.default_request_options["system_prompt"] = "default instruction";
+    const auto wav_path = f.root / "transcription-input.wav";
+    engine::audio::write_pcm16_wav(wav_path, 16000, 1, {0.1f, -0.1f});
+    const auto check = [&](const std::string & id, const std::shared_ptr<Control> & control,
+                           const std::string & options, const std::optional<std::string> & expected) {
+        const auto response = post(*f.state, "/v1/audio/transcriptions",
+            "{\"model\":" + quote(id) + ",\"audio\":" + quote(wav_path.generic_string()) +
+            ",\"text\":\"context\"" + options + "}");
+        success(response);
+        std::lock_guard<std::mutex> lock(control->options_mutex);
+        const auto it = control->last_options.find("system_prompt");
+        require(expected ? it != control->last_options.end() && it->second == *expected
+                         : it == control->last_options.end(),
+                "transcription forwarded the wrong system_prompt");
+    };
+    check("transcription-drama", drama, "", std::nullopt);
+    check("transcription-drama", drama, ",\"options\":{\"system_prompt\":\"explicit instruction\"}", std::nullopt);
+    check("transcription-other", other, "", "default instruction");
+    check("transcription-other", other, ",\"options\":{\"system_prompt\":\"explicit instruction\"}", "explicit instruction");
+
+    srv::RuntimeVoicePreset preset;
+    preset.options["system_prompt"] = "preset instruction";
+    drama_model.voice_presets.emplace("preset", std::move(preset));
+    srv::ServerModelConfig::VoicePreset config_preset;
+    config_preset.options["system_prompt"] = "preset instruction";
+    drama_model.config.voice_presets.emplace("preset", std::move(config_preset));
+    const auto speech = [&](const std::string & options, const std::optional<std::string> & expected) {
+        const auto response = post(*f.state, "/v1/audio/speech",
+            "{\"model\":\"transcription-drama\",\"input\":\"hello\",\"voice\":\"preset\"" + options + "}");
+        success(response);
+        std::lock_guard<std::mutex> lock(drama->options_mutex);
+        const auto it = drama->last_options.find("system_prompt");
+        require(expected ? it != drama->last_options.end() && it->second == *expected
+                         : it == drama->last_options.end(),
+                "speech forwarded the wrong request-scoped system_prompt");
+    };
+    speech("", std::nullopt);
+    speech(",\"options\":{\"system_prompt\":\"\"}", "");
+    speech(",\"options\":{\"system_prompt\":\"explicit instruction\"}", "explicit instruction");
 }
 
 int main(int argc, char ** argv) {
@@ -1325,6 +1399,7 @@ int main(int argc, char ** argv) {
         generic_batch_single_slot_and_invalid_input();
         inline_audio_request_logging();
         generic_inline_audio_transport();
+        transcription_does_not_forward_drama_system_prompt();
         for (int count : {1, 2, 4}) {
             older_work_before_management(count, false);
             older_work_before_management(count, true);

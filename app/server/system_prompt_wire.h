@@ -69,40 +69,52 @@ private:
         return State::Ignore;
     }
 
-    void value(State state) {
+    bool value(State state) {
         space();
         if (pos_ >= text_.size()) throw engine::runtime::InvalidRequestError("invalid JSON request");
         if (text_[pos_] == '"') {
             const auto value = string_token();
             if (state == State::Prompt && value.nul)
                 throw engine::runtime::InvalidRequestError("options.system_prompt cannot contain NUL");
-            return;
+            return state == State::Prompt;
         }
         if (text_[pos_] == '{') {
             ++pos_;
             space();
-            if (pos_ < text_.size() && text_[pos_] == '}') { ++pos_; return; }
+            if (pos_ < text_.size() && text_[pos_] == '}') { ++pos_; return state == State::Prompt; }
+            bool found_prompt = state == State::Prompt;
+            bool ambiguous_options = false;
+            bool normal_options_with_prompt = false;
             for (;;) {
                 space();
                 const auto key = string_token();
                 space();
                 ++pos_; // Colon: the full document has already been validated.
-                value(member(state, key));
+                const auto child_state = member(state, key);
+                const bool child_prompt = value(child_state);
+                found_prompt = found_prompt || child_prompt;
+                ambiguous_options = ambiguous_options || child_state == State::AmbiguousOptions;
+                normal_options_with_prompt = normal_options_with_prompt ||
+                    (child_state == State::Options && child_prompt);
+                if (ambiguous_options && normal_options_with_prompt)
+                    throw engine::runtime::InvalidRequestError("system_prompt key contains NUL");
                 space();
-                if (text_[pos_++] == '}') return;
+                if (text_[pos_++] == '}') return found_prompt;
             }
         }
         if (text_[pos_] == '[') {
             ++pos_;
             space();
-            if (pos_ < text_.size() && text_[pos_] == ']') { ++pos_; return; }
+            if (pos_ < text_.size() && text_[pos_] == ']') { ++pos_; return state == State::Prompt; }
+            bool found_prompt = state == State::Prompt;
             for (;;) {
-                value(state == State::Requests ? State::BatchItem : State::Ignore);
+                found_prompt = value(state == State::Requests ? State::BatchItem : State::Ignore) || found_prompt;
                 space();
-                if (text_[pos_++] == ']') return;
+                if (text_[pos_++] == ']') return found_prompt;
             }
         }
         while (pos_ < text_.size() && text_[pos_] != ',' && text_[pos_] != '}' && text_[pos_] != ']') ++pos_;
+        return state == State::Prompt;
     }
 
     std::string_view text_;

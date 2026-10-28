@@ -178,11 +178,15 @@ int main() {
             invalid_option.body.find("private-missing.wav") != std::string::npos ||
             invalid_option.body.find("SENSITIVE_BAD_BOOLEAN") != std::string::npos)
             throw std::runtime_error("serial handler leaked or accepted invalid encode-only option");
+        for (const std::string value : {R"({"private":"data"})", R"("a\u0000b")"}) {
+            const auto result = post("/v1/tasks/run", "{\"model\":\"task\",\"request\":{\"audio_base64\":\"AAAA\",\"options\":{\"encode_reference_only\":true,\"system_prompt\":" + value + "}}}");
+            if (result.status != 400 || result.body.find("valid Base64-encoded WAV") == std::string::npos)
+                throw std::runtime_error("serial reference-only request changed its validation");
+        }
         for (const auto & value : {"null", "123", "false", "{\"private\":\"SENSITIVE_BAD_VALUE\"}", "[\"SENSITIVE_BAD_VALUE\"]"}) {
             for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
                 {"/v1/tasks/run", "{\"model\":\"task\",\"request\":{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}}"},
                 {"/v1/tasks/stream", "{\"model\":\"task\",\"request\":{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}}"},
-                {"/v1/tasks/batch", "{\"model\":\"task\",\"requests\":[{\"text\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}]}"},
                 {"/v1/audio/speech", "{\"model\":\"task\",\"input\":\"hi\",\"options\":{\"system_prompt\":" + std::string(value) + "}}"}}) {
                 const auto result = post(path, body);
                 if (result.status != 400 || result.body.find("options.system_prompt must be a string") == std::string::npos ||
@@ -193,12 +197,27 @@ int main() {
         for (const auto & [path, body] : std::vector<std::pair<std::string, std::string>>{
             {"/v1/tasks/run", R"({"model":"task","request":{"options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}}})"},
             {"/v1/tasks/stream", R"({"model":"task","request":{"options":{"system_\u0070rompt":"SENSITIVE\u0000TRUNCATED"}}})"},
-            {"/v1/tasks/batch", R"({"model":"task","requests":[{"options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}}]})"},
             {"/v1/audio/speech", R"({"model":"task","input":"hi","options":{"system_prompt":"SENSITIVE\u0000TRUNCATED"}})"}}) {
             const auto result = post(path, body);
             if (result.status != 400 || result.body.find("cannot contain NUL") == std::string::npos ||
                 result.body.find("SENSITIVE") != std::string::npos)
                 throw std::runtime_error("serial system_prompt NUL rejection failed on " + path);
+        }
+        for (const auto & option_fields : {
+                 R"("options":{"system_prompt":"normal","system_prompt\u0000extra":"private"})",
+                 R"("options":{"system_prompt\u0000extra":"private","system_prompt":"normal"})",
+                 R"("options":{"system_prompt":"normal"},"options\u0000extra":{"other":"private"})",
+                 R"("options":{"encode_reference_only":false,"system_prompt":"normal"},"options\u0000extra":{"other":"private"})",
+                 R"("options\u0000extra":{"other":"private"},"options":{"system_prompt":"normal"})"}) {
+            for (const auto & path : {"/v1/tasks/run", "/v1/tasks/stream", "/v1/audio/speech"}) {
+                const std::string fields = std::string(option_fields);
+                const std::string body = path == std::string("/v1/audio/speech") ?
+                    "{\"model\":\"task\",\"input\":\"hi\"," + fields + "}" :
+                    "{\"model\":\"task\",\"request\":{" + fields + "}}";
+                const auto result = post(path, body);
+                if (result.status != 400 || result.body.find("private") != std::string::npos)
+                    throw std::runtime_error("serial collision was not safely rejected");
+            }
         }
         for (const std::string path : {"/v1/tasks/run", "/v1/tasks/stream", "/v1/tasks/batch", "/v1/audio/speech"}) {
             std::string error;

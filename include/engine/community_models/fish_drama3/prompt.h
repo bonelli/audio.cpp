@@ -14,6 +14,7 @@ struct Drama3Take {
 
 void validate_drama3_text(const std::string & text, const char * location);
 void validate_drama3_system_prompt(const std::string & text);
+void validate_drama3_system_prompt(const std::string & text, const Drama3TextTokenizer & tokenizer);
 void validate_drama3_codes(const codecs::FishDacCodes & codes, int64_t codebook_size);
 std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
     const Drama3TextTokenizer & tokenizer, const std::string & text,

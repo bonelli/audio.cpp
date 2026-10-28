@@ -237,6 +237,10 @@ void Drama3Generator::warm_streaming_codec(const codecs::FishDacCodes & referenc
     codec_->reset_decode_stream();
 }
 
+void Drama3Generator::validate_system_prompt(const std::string & text) const {
+    validate_drama3_system_prompt(text, tokenizer_);
+}
+
 Drama3Generation Drama3Generator::generate(const std::string & text, const std::vector<Drama3Take> & references,
     const std::vector<Drama3Take> & history, const Drama3Sampling & sampling, bool streaming,
     const std::function<void(const runtime::AudioBuffer &)> & on_audio, bool continuation,

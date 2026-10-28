@@ -39,4 +39,8 @@ std::vector<int32_t> Drama3TextTokenizer::encode(const std::string & text) const
         std::string(reinterpret_cast<const char *>(normalized.get()), static_cast<size_t>(size)), true);
 }
 
+bool Drama3TextTokenizer::is_control_token_id(int32_t token_id) const {
+    return tokenizer_.is_control_token_id(token_id);
+}
+
 }  // namespace engine::models::fish_drama3

@@ -98,6 +98,28 @@ void system_prompt_validation() {
     drama::validate_drama3_text("<|speaker:0|> Hello [laughs]", "input");
 }
 
+void all_special_tokens_rejected(const drama::Drama3TextTokenizer & tokenizer, const std::string & directory) {
+    const auto manifest = json::parse_file(directory + "/tokenizer.json");
+    size_t count = 0;
+    for (const auto & item : manifest.require("added_tokens").as_array()) {
+        const auto * special = item.find("special");
+        if (!special || !special->is_bool() || !special->as_bool()) continue;
+        const auto token = item.require("content").as_string();
+        bool rejected = false;
+        try { drama::validate_drama3_system_prompt("ordinary " + token + " end", tokenizer); }
+        catch (const engine::runtime::InvalidRequestError & error) {
+            rejected = true;
+            if (std::string(error.what()).find(token) != std::string::npos)
+                throw std::runtime_error("system validation echoed a reserved token");
+        }
+        if (!rejected) throw std::runtime_error("tokenizer special token accepted in system prompt");
+        ++count;
+    }
+    if (!count) throw std::runtime_error("tokenizer fixture has no special tokens");
+    drama::validate_drama3_system_prompt("ordinary text <slow>hello</slow>", tokenizer);
+    drama::validate_drama3_system_prompt("ordinary text <think>hello</think>", tokenizer);
+}
+
 int main(int argc, char ** argv) {
     try {
         if (argc != 3) throw std::runtime_error("usage: tokenizer_test SIDECAR_DIRECTORY VECTORS_JSON");
@@ -106,6 +128,7 @@ int main(int argc, char ** argv) {
                                    {"tokenizer_config", "tokenizer_config.json"}});
         drama::Drama3TextTokenizer tokenizer(resources);
         system_prompt_validation();
+        all_special_tokens_rejected(tokenizer, argv[1]);
         prompt_contract(tokenizer);
         const auto vectors = json::parse_file(argv[2]);
         int passed = 0;

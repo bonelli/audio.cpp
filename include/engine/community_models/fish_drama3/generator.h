@@ -30,6 +30,7 @@ public:
     codecs::FishDacCodes encode_reference(const runtime::AudioBuffer & audio);
     codecs::FishDacCodes encode_inline_reference(const runtime::AudioBuffer & audio);
     void warm_streaming_codec(const codecs::FishDacCodes & reference);
+    void validate_system_prompt(const std::string & text) const;
     Drama3Generation generate(const std::string & text, const std::vector<Drama3Take> & references,
         const std::vector<Drama3Take> & history, const Drama3Sampling & sampling, bool streaming,
         const std::function<void(const runtime::AudioBuffer &)> & on_audio = {}, bool continuation = false,

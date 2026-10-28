@@ -341,8 +341,10 @@ remain in their existing order. For example, a generic task request can include:
 ```
 
 The same option is available on task streaming and the speech API's `options`
-object. The JSON interface rejects U+0000 in this field because the current
-JSON parser cannot preserve it. Structural-token delimiters such as `<|` are rejected;
+object. For synthesis, the JSON interface rejects U+0000 in this field because
+the current JSON parser cannot preserve it. Reference-only encoding ignores
+this option. Model control tokens and structural-token
+delimiters such as `<|` are rejected in this field;
 the ordinary text and speaker-tag syntax is unchanged. The instruction counts
 towards the model's context alongside references, text and generation budget.
 Do not place private instructions in model configuration, URL query parameters,

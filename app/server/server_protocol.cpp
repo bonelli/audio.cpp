@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -65,23 +66,56 @@ engine::runtime::TaskRequest apply_default_request_options(
   return request;
 }
 
-bool ambiguous_drama3_inline_reference(const Value &request, const ServerModelConfig &model) {
-  const auto *audio = request.find("audio_base64");
-  const auto *voice = request.find("voice_ref");
-  if (model.family != "fish_drama3" || audio == nullptr || audio->is_null() ||
-      voice == nullptr || voice->is_null()) return false;
-  auto options = model.default_request_options;
-  for (auto &[key, value] : options_from_object(request.find("options"))) options[key] = std::move(value);
-  const auto selected = engine::runtime::find_option(options, {"encode_reference_only"});
-  if (!selected) return false;
+bool is_drama3_reference_only(const Value &request, const ServerModelConfig &model,
+                              bool speech_route) {
+  if (model.family != "fish_drama3") return false;
+  std::optional<std::string> selected;
+  const auto select_from = [&](const auto &options) {
+    const auto it = options.find("encode_reference_only");
+    if (it != options.end()) selected = it->second;
+  };
+  select_from(model.default_request_options);
+  if (speech_route) {
+    const ServerModelConfig::VoicePreset *preset = nullptr;
+    const auto *voice = request.find("voice");
+    const bool has_voice = voice != nullptr && !voice->is_null() &&
+        !(voice->is_string() && voice->as_string().empty());
+    if (has_voice && voice->is_string()) {
+      const auto it = model.voice_presets.find(voice->as_string());
+      if (it != model.voice_presets.end()) preset = &it->second;
+    } else if (!has_voice && request.find("voice_ref") == nullptr) {
+      if (model.default_voice_preset_id) {
+        const auto it = model.voice_presets.find(*model.default_voice_preset_id);
+        if (it != model.voice_presets.end()) preset = &it->second;
+      } else if (model.default_voice_preset) {
+        preset = &*model.default_voice_preset;
+      }
+    }
+    if (preset) select_from(preset->options);
+  }
+  if (const auto *options = request.find("options"); options && !options->is_null()) {
+    (void) options->as_object();
+    if (const auto *flag = options->find("encode_reference_only"))
+      selected = minitts::cli::json_option_string(*flag);
+  }
+  if (!selected || selected->empty()) return false;
   try { return engine::runtime::parse_bool_option(*selected, "encode_reference_only"); }
   catch (const std::runtime_error &) {
     throw engine::runtime::InvalidRequestError("encode_reference_only must be true/false, yes/no, on/off, or 1/0");
   }
 }
 
-void validate_drama3_system_prompt(const Value &request, const ServerModelConfig &model) {
-  if (model.family != "fish_drama3") return;
+bool ambiguous_drama3_inline_reference(const Value &request, const ServerModelConfig &model) {
+  const auto *audio = request.find("audio_base64");
+  const auto *voice = request.find("voice_ref");
+  if (model.family != "fish_drama3" || audio == nullptr || audio->is_null() ||
+      voice == nullptr || voice->is_null()) return false;
+  return is_drama3_reference_only(request, model);
+}
+
+void validate_drama3_system_prompt(const Value &request, const ServerModelConfig &model,
+                                   bool speech_route) {
+  if (model.family != "fish_drama3" || is_drama3_reference_only(request, model, speech_route)) return;
   const auto *options = request.find("options");
   if (options == nullptr || options->is_null() || !options->is_object()) return;
   const auto *value = options->find("system_prompt");
@@ -90,14 +124,61 @@ void validate_drama3_system_prompt(const Value &request, const ServerModelConfig
   }
 }
 
+engine::runtime::TaskRequest preserve_request_scoped_drama3_system_prompt(
+    engine::runtime::TaskRequest request, const Value &request_json,
+    const ServerModelConfig &model) {
+  if (model.family != "fish_drama3") return request;
+  const auto *options = request_json.find("options");
+  if (options == nullptr || !options->is_object() || options->find("system_prompt") == nullptr) {
+    // Legacy defaults and voice presets could contain this previously ignored
+    // option. Only an explicit value on this request may select an instruction.
+    request.options.erase("system_prompt");
+  }
+  return request;
+}
+
 void validate_drama3_system_prompt_wire(const std::string &body, const Value &parsed,
-                                        const ServerModelConfig &model, bool batch, bool nested_request) {
-  if (model.family != "fish_drama3") return;
+                                        const ServerModelConfig &model, bool batch, bool nested_request,
+                                        bool speech_route) {
+  // Drama3 has no native batch implementation. Preserve its existing batch
+  // rejection without interpreting an option that cannot reach the model.
+  if (model.family != "fish_drama3" || batch) return;
+  const auto *nested = nested_request ? parsed.find("request") : nullptr;
+  const auto &request = nested != nullptr ? *nested : parsed;
+  if (is_drama3_reference_only(request, model, speech_route)) return;
   if (body.find("\\u0000") == std::string::npos && body.find('\0') == std::string::npos) return;
   const auto shape = batch ? SystemPromptRequestShape::Batch :
       (nested_request && parsed.find("request") != nullptr ? SystemPromptRequestShape::NestedRequest :
                                                              SystemPromptRequestShape::Root);
   SystemPromptWireScan(body, shape).validate();
+}
+
+Value parse_task_body_guarded(
+    const std::string &body,
+    const std::function<std::optional<ServerModelConfig>(const Value &)> &lookup,
+    bool batch, bool nested_request, bool speech_route) {
+  try {
+    return engine::io::json::parse(body);
+  } catch (const std::runtime_error &) {
+    const auto original = std::current_exception();
+    if (!batch && (body.find("\\u0000") != std::string::npos || body.find('\0') != std::string::npos)) {
+      try {
+        const auto routing = engine::io::json::inspect_root_routing(body);
+        if (routing) {
+          const auto model = lookup(*routing);
+          if (model) validate_drama3_system_prompt_wire(body, *routing, *model, batch, nested_request, speech_route);
+        }
+      } catch (const engine::runtime::InvalidRequestError &error) {
+        const std::string_view message(error.what());
+        if (message == "system_prompt key contains NUL" ||
+            message == "options.system_prompt cannot contain NUL") throw;
+      } catch (...) {
+        // An unrelated lookup or inspection failure must not replace the
+        // original parse error for other requests.
+      }
+    }
+    std::rethrow_exception(original);
+  }
 }
 
 engine::runtime::TaskRequest

@@ -838,14 +838,14 @@ ParallelServerState::LoadedModel & ParallelServerState::require_model(const Valu
 
 engine::runtime::TaskRequest ParallelServerState::build_speech_request(const LoadedModel & model, const Value & body) const {
     std::shared_lock<std::shared_mutex> metadata_lock(model.metadata_mutex);
-    validate_drama3_system_prompt(body, model.config);
-    return minitts::server::build_speech_request(
+    validate_drama3_system_prompt(body, model.config, true);
+    return preserve_request_scoped_drama3_system_prompt(minitts::server::build_speech_request(
         body,
         SpeechRequestContext{
             request_base_, config_.voice_dir, model.voice_presets, model.default_voice_preset,
             model.accepts_reference_text, model.accepts_speed,
             model.accepts_speaking_rate,
-            model.config.default_request_options});
+            model.config.default_request_options}), body, model.config);
 }
 
 struct ParallelServerState::TimedTaskResult {
@@ -972,9 +972,17 @@ ParallelServerState::TimedTaskResult ParallelServerState::run_streaming_model_fr
 }
 
 HttpResponse ParallelServerState::handle_speech(const std::string & body_text) {
-    const auto body = engine::io::json::parse(body_text);
+    const auto body = parse_task_body_guarded(body_text,
+        [this](const Value & probe) -> std::optional<ServerModelConfig> {
+            auto & model = require_model(probe);
+            std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+            return model.config;
+        }, false, false, true);
     auto & model = require_model(body);
-    validate_drama3_system_prompt_wire(body_text, body, model.config, false, false);
+    {
+        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+        validate_drama3_system_prompt_wire(body_text, body, model.config, false, false, true);
+    }
     const auto busy_timeout_ms = parse_busy_timeout_override(body);
     auto request_lease = bind_request(model, busy_timeout_ms);
     const auto request = build_speech_request(model, body);
@@ -1212,10 +1220,15 @@ HttpResponse ParallelServerState::handle_speech_live(const HttpRequest & request
         add_query_option("repetition_penalty", "repetition_penalty");
         add_query_option("guidance_scale", "guidance_scale");
         add_query_option("num_inference_steps", "num_inference_steps");
-        if (model.config.family != "fish_drama3") add_query_option("instructions", "system_prompt");
+        bool allow_system_query;
+        {
+            std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+            allow_system_query = model.config.family != "fish_drama3";
+        }
+        if (allow_system_query) add_query_option("instructions", "system_prompt");
         add_query_option("reference_text", "reference_text");
         add_query_option("voice_id", "voice_id");
-        if (model.config.family != "fish_drama3") add_query_option("system_prompt", "system_prompt");
+        if (allow_system_query) add_query_option("system_prompt", "system_prompt");
         add_query_option("text_temperature", "text_temperature");
         add_query_option("text_top_k", "text_top_k");
         add_query_option("do_sample", "do_sample");
@@ -1380,9 +1393,13 @@ HttpResponse ParallelServerState::handle_transcription_json(const std::string & 
     auto & model = require_model(body);
     const auto busy_timeout_ms = parse_busy_timeout_override(body);
     auto request_lease = bind_request(model, busy_timeout_ms);
-    const auto request = apply_default_request_options(
+    auto request = apply_default_request_options(
         model.config.default_request_options,
         build_openai_transcription_request(body, request_base_, model.accepts_language));
+    {
+        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+        if (model.config.family == "fish_drama3") request.options.erase("system_prompt");
+    }
     if (bool_field(body, "stream", false)) {
         if (detail) {
             return error_response(400, kDetailStreamUnsupported, "invalid_request_error");
@@ -1476,10 +1493,14 @@ HttpResponse ParallelServerState::handle_transcription_multipart(
 
     auto & model = require_model(body);
     auto request_lease = bind_request(model, busy_timeout_ms);
-    const auto request = apply_default_request_options(
+    auto request = apply_default_request_options(
         model.config.default_request_options,
         build_openai_transcription_request(
             body, request_base_, model.accepts_language, &file_part->data));
+    {
+        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+        if (model.config.family == "fish_drama3") request.options.erase("system_prompt");
+    }
     if (stream) {
         if (detail) {
             return error_response(400, kDetailStreamUnsupported, "invalid_request_error");
@@ -2026,6 +2047,10 @@ HttpResponse ParallelServerState::handle_transcription_live(const HttpRequest & 
         }
         task_request = apply_default_request_options(
             model.config.default_request_options, std::move(task_request));
+        {
+            std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+            if (model.config.family == "fish_drama3") task_request.options.erase("system_prompt");
+        }
     } catch (const ServerBusyError &) {
         throw;
     } catch (const std::runtime_error & ex) {
@@ -2112,14 +2137,25 @@ engine::runtime::TaskRequest parallel_drop_unsupported_language_option(
 }
 
 HttpResponse ParallelServerState::handle_generic_run(const std::string & body_text) {
-    const auto body = engine::io::json::parse(body_text);
+    const auto body = parse_task_body_guarded(body_text,
+        [this](const Value & probe) -> std::optional<ServerModelConfig> {
+            auto & model = require_model(probe);
+            std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+            return model.config;
+        }, false, true);
     auto & model = require_model(body);
-    validate_drama3_system_prompt_wire(body_text, body, model.config, false, true);
+    {
+        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+        validate_drama3_system_prompt_wire(body_text, body, model.config, false, true);
+    }
     const auto busy_timeout_ms = parse_busy_timeout_override(body);
     auto request_lease = bind_request(model, busy_timeout_ms);
     const auto * request_json = body.find("request");
     const auto & effective_json = request_json != nullptr ? *request_json : body;
-    validate_drama3_system_prompt(effective_json, model.config);
+    {
+        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+        validate_drama3_system_prompt(effective_json, model.config);
+    }
     if (ambiguous_drama3_inline_reference(effective_json, model.config)) {
         return error_response(400, "provide only one of audio input or voice_ref for reference encoding", "invalid_request_error");
     }
@@ -2148,12 +2184,16 @@ HttpResponse ParallelServerState::handle_generic_run(const std::string & body_te
         parsed_request.audio_input = std::move(*inline_audio);
         parsed_request.audio_input_is_inline = true;
     }
-    const auto request = apply_default_request_options(
+    auto request = apply_default_request_options(
         model.config.default_request_options,
         parallel_drop_unsupported_language_option(
             std::move(parsed_request),
             effective_json,
             model.accepts_language));
+    {
+        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+        request = preserve_request_scoped_drama3_system_prompt(std::move(request), effective_json, model.config);
+    }
     const auto timed_result = model_run_mode(model) == engine::runtime::RunMode::Streaming
         ? run_streaming_model(model, request, {}, busy_timeout_ms, request_lease)
         : run_model(model, request, busy_timeout_ms, request_lease);
@@ -2161,9 +2201,13 @@ HttpResponse ParallelServerState::handle_generic_run(const std::string & body_te
 }
 
 HttpResponse ParallelServerState::handle_generic_batch(const std::string & body_text) {
-    const auto body = engine::io::json::parse(body_text);
+    const auto body = parse_task_body_guarded(body_text,
+        [this](const Value & probe) -> std::optional<ServerModelConfig> {
+            auto & model = require_model(probe);
+            std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+            return model.config;
+        }, true, true);
     auto & model = require_model(body);
-    validate_drama3_system_prompt_wire(body_text, body, model.config, true, false);
     const auto busy_timeout_ms = parse_busy_timeout_override(body);
     auto request_lease = bind_request(model, busy_timeout_ms);
     if (model_run_mode(model) != engine::runtime::RunMode::Offline) {
@@ -2189,7 +2233,6 @@ HttpResponse ParallelServerState::handle_generic_batch(const std::string & body_
                 "task batch entries must be JSON objects",
                 "invalid_request_error");
         }
-        validate_drama3_system_prompt(request_json, model.config);
         requests.push_back(apply_default_request_options(
             model.config.default_request_options,
             parallel_drop_unsupported_language_option(
@@ -2272,21 +2315,36 @@ HttpResponse ParallelServerState::handle_generic_batch(const std::string & body_
 }
 
 HttpResponse ParallelServerState::handle_generic_stream(const std::string & body_text) {
-    const auto body = engine::io::json::parse(body_text);
+    const auto body = parse_task_body_guarded(body_text,
+        [this](const Value & probe) -> std::optional<ServerModelConfig> {
+            auto & model = require_model(probe);
+            std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+            return model.config;
+        }, false, true);
     auto & model = require_model(body);
-    validate_drama3_system_prompt_wire(body_text, body, model.config, false, true);
+    {
+        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+        validate_drama3_system_prompt_wire(body_text, body, model.config, false, true);
+    }
     const bool sse = task_stream_sse_requested(body);
     const auto busy_timeout_ms = parse_busy_timeout_override(body);
     auto request_lease = bind_request(model, busy_timeout_ms);
     const auto * request_json = body.find("request");
     const auto & effective_json = request_json != nullptr ? *request_json : body;
-    validate_drama3_system_prompt(effective_json, model.config);
+    {
+        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+        validate_drama3_system_prompt(effective_json, model.config);
+    }
     auto request = apply_default_request_options(
         model.config.default_request_options,
         parallel_drop_unsupported_language_option(
             minitts::cli::build_request_from_json(effective_json, request_base_),
             effective_json,
             model.accepts_language));
+    {
+        std::shared_lock<std::shared_mutex> lock(model.metadata_mutex);
+        request = preserve_request_scoped_drama3_system_prompt(std::move(request), effective_json, model.config);
+    }
     if (sse) {
         bool diarization;
         {

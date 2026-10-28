@@ -65,14 +65,27 @@ engine::runtime::TaskRequest build_speech_request(
     const engine::io::json::Value &body,
     const SpeechRequestContext &context);
 void validate_drama3_system_prompt(const engine::io::json::Value &request,
-                                   const ServerModelConfig &model);
+                                   const ServerModelConfig &model,
+                                   bool speech_route = false);
+bool is_drama3_reference_only(const engine::io::json::Value &request,
+                              const ServerModelConfig &model,
+                              bool speech_route = false);
 void validate_drama3_system_prompt_wire(const std::string &body,
                                         const engine::io::json::Value &parsed,
                                         const ServerModelConfig &model,
-                                        bool batch, bool nested_request);
+                                        bool batch, bool nested_request,
+                                        bool speech_route = false);
+engine::io::json::Value parse_task_body_guarded(
+    const std::string &body,
+    const std::function<std::optional<ServerModelConfig>(const engine::io::json::Value &)> &lookup,
+    bool batch, bool nested_request, bool speech_route = false);
 engine::runtime::TaskRequest apply_default_request_options(
     const std::unordered_map<std::string, std::string> &default_options,
     engine::runtime::TaskRequest request);
+engine::runtime::TaskRequest preserve_request_scoped_drama3_system_prompt(
+    engine::runtime::TaskRequest request,
+    const engine::io::json::Value &request_json,
+    const ServerModelConfig &model);
 bool ambiguous_drama3_inline_reference(const engine::io::json::Value &request,
                                        const ServerModelConfig &model);
 std::string safe_upload_name(std::string value);

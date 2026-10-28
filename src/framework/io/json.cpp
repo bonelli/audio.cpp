@@ -15,6 +15,7 @@ namespace engine::io::json {
 namespace {
 // Set once at parallel-server startup, before any concurrent parser callers.
 bool serialized_json_parsing = false;
+std::mutex parse_mutex;
 
 cJSON * make_cjson(const Value & value) {
     switch (value.kind()) {
@@ -369,7 +370,6 @@ Value parse(std::string_view text) {
     if (serialized_json_parsing) {
         // cJSON writes its global error position even when return_parse_end is
         // supplied. Serialize that call; conversion and deletion are per-tree.
-        static std::mutex parse_mutex;
         std::lock_guard<std::mutex> lock(parse_mutex);
         root = cJSON_ParseWithLengthOpts(text.data(), text.size(), &parse_end, 0);
     } else {
@@ -394,6 +394,95 @@ Value parse(std::string_view text) {
         cJSON_Delete(root);
         throw;
     }
+}
+
+std::optional<Value> inspect_root_routing(std::string_view text) {
+    const char * parse_end = nullptr;
+    cJSON * root = nullptr;
+    if (serialized_json_parsing) {
+        std::lock_guard<std::mutex> lock(parse_mutex);
+        root = cJSON_ParseWithLengthOpts(text.data(), text.size(), &parse_end, 0);
+    } else {
+        root = cJSON_ParseWithLengthOpts(text.data(), text.size(), &parse_end, 0);
+    }
+    if (!root) return std::nullopt;
+    std::optional<Value> result;
+    try {
+        bool valid = cJSON_IsObject(root) != 0;
+        for (const char * cursor = parse_end; valid && cursor && cursor < text.data() + text.size(); ++cursor) {
+            if (!std::isspace(static_cast<unsigned char>(*cursor))) valid = false;
+        }
+        const cJSON * model = nullptr;
+        const cJSON * request = nullptr;
+        bool duplicate = false;
+        for (const cJSON * child = root->child; valid && child; child = child->next) {
+            if (!child->string) { valid = false; break; }
+            const std::string_view key(child->string);
+            if (key == "model") {
+                if (model) duplicate = true;
+                model = child;
+            } else if (key == "request") {
+                if (request) duplicate = true;
+                request = child;
+            }
+        }
+        if (valid && !duplicate && model && cJSON_IsString(model) && model->valuestring) {
+            const auto minimal_request = [&](const cJSON * source) -> std::optional<Value> {
+                if (!cJSON_IsObject(source)) return Value::make_null();
+                Value::Object selected;
+                int options_count = 0;
+                bool encoding_flag_seen = false;
+                bool first_option_explicitly_disables_encoding = false;
+                for (const cJSON * child = source->child; child; child = child->next) {
+                    if (!child->string) return std::nullopt;
+                    const std::string_view key(child->string);
+                    if (key == "options") {
+                        ++options_count;
+                        if (!cJSON_IsObject(child)) continue;
+                        Value::Object options;
+                        for (const cJSON * opt = child->child; opt; opt = opt->next) {
+                            if (opt->string && std::string_view(opt->string) == "encode_reference_only") {
+                                if (encoding_flag_seen) return std::nullopt;
+                                encoding_flag_seen = true;
+                                if (options_count == 1) {
+                                    if (cJSON_IsFalse(opt) || (cJSON_IsNumber(opt) && opt->valuedouble == 0))
+                                        first_option_explicitly_disables_encoding = true;
+                                    if (cJSON_IsString(opt) && opt->valuestring) {
+                                        const std::string_view flag(opt->valuestring);
+                                        first_option_explicitly_disables_encoding =
+                                            flag == "false" || flag == "0" || flag == "no" || flag == "off";
+                                    }
+                                }
+                                options.emplace("encode_reference_only", convert_cjson(opt));
+                            }
+                        }
+                        if (!selected.count("options")) selected.emplace("options", Value::make_object(std::move(options)));
+                    } else if (key == "voice" || key == "voice_ref") {
+                        if (selected.count(std::string(key))) return std::nullopt;
+                        if (cJSON_IsNull(child)) selected.emplace(std::string(key), Value::make_null());
+                        else if (key == "voice" && cJSON_IsString(child) && child->valuestring)
+                            selected.emplace(std::string(key), Value::make_string(child->valuestring));
+                        else selected.emplace(std::string(key), Value::make_bool(true));
+                    }
+                }
+                if (options_count > 1 && encoding_flag_seen && !first_option_explicitly_disables_encoding)
+                    return std::nullopt;
+                return Value::make_object(std::move(selected));
+            };
+            auto selected = minimal_request(request ? request : root);
+            if (!selected) { cJSON_Delete(root); return std::nullopt; }
+            Value::Object fields;
+            fields.emplace("model", Value::make_string(model->valuestring));
+            if (request) fields.emplace("request", std::move(*selected));
+            else for (auto &[key, value] : selected->as_object()) fields.emplace(key, value);
+            result = Value::make_object(std::move(fields));
+        }
+    } catch (...) {
+        cJSON_Delete(root);
+        throw;
+    }
+    cJSON_Delete(root);
+    return result;
 }
 
 Value parse_jsonc(std::string_view text) {
