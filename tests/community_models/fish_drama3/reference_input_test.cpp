@@ -1,4 +1,5 @@
 #include "../../../src/community_models/fish_drama3/reference_input.h"
+#include "../../../src/community_models/fish_drama3/text_units.h"
 #include "../../../src/community_models/fish_drama3/encode_graph_guard.h"
 #include "../../../src/framework/codecs/fish_dac_encoder_chunks.h"
 
@@ -138,6 +139,29 @@ void codec_override_and_cleanup() {
     { engine::models::fish_drama3::detail::EncodeGraphGuard<FakeCodec> guard{codec}; }
     require(codec.releases == 2, "subsequent successful encoding did not release its graph");
 }
+
+void whole_text_mode_preserves_one_exact_unit() {
+    rt::TaskRequest request;
+    request.text_input = rt::Transcript{"  A complete paragraph.\n" + std::string(3000, 'a') + " \n", "it"};
+    request.options["text_chunk_mode"] = "none";
+    const auto units = engine::models::fish_drama3::detail::text_units(request);
+    require(units.size() == 1 && units[0].text_input->text == request.text_input->text,
+        "whole-text mode changed or split the input");
+    request.options["text_chunk_size"] = "999999";
+    rejects([&] { (void)engine::models::fish_drama3::detail::text_units(request); }, "cannot also");
+    request.options.erase("text_chunk_size");
+    request.text_input.reset();
+    rejects([&] { (void)engine::models::fish_drama3::detail::text_units(request); }, "input text");
+    request.text_input = rt::Transcript{"   ", "it"};
+    rejects([&] { (void)engine::models::fish_drama3::detail::text_units(request); }, "empty");
+    request.options["text_chunk_mode"] = "unsupported";
+    rejects([&] { (void)engine::models::fish_drama3::detail::text_units(request); }, "chunk options");
+    request.text_input = rt::Transcript{"First sentence. Second sentence. Third sentence.", "it"};
+    request.options.clear();
+    request.options["text_chunk_size"] = "20";
+    require(engine::models::fish_drama3::detail::text_units(request).size() > 1,
+        "default chunking compatibility was lost");
+}
 }
 
 int main() {
@@ -147,6 +171,7 @@ int main() {
         path_and_ordinary_text_contracts_are_preserved();
         system_prompt_validation_is_private();
         codec_override_and_cleanup();
+        whole_text_mode_preserves_one_exact_unit();
         std::cout << "Drama 3 inline reference request checks passed\n";
     } catch (const std::exception & error) {
         std::cerr << error.what() << '\n';

@@ -1,5 +1,6 @@
 #include "engine/community_models/fish_drama3/session.h"
 #include "reference_input.h"
+#include "text_units.h"
 
 #include "engine/framework/audio/wav_reader.h"
 #include "engine/framework/debug/trace.h"
@@ -136,12 +137,19 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
         system_prompt = it->second;
     }
     bool encode_only = false;
+    bool inspect_only = false;
     try {
         if (const auto prepare = runtime::find_option(effective.options, {"encode_reference_only"})) {
             encode_only = runtime::parse_bool_option(*prepare, "encode_reference_only");
         }
+        if (const auto inspect = runtime::find_option(effective.options, {"inspect_prompt_only"})) {
+            inspect_only = runtime::parse_bool_option(*inspect, "inspect_prompt_only");
+        }
     } catch (const std::runtime_error & error) {
         throw runtime::InvalidRequestError(error.what());
+    }
+    if (inspect_only && (encode_only || request.audio_input || effective.voice || !detail::single_text_unit(effective))) {
+        throw runtime::InvalidRequestError("Prompt inspection requires text_chunk_mode=none and compiled conditioning only");
     }
     if (!encode_only && system_prompt) generator_->validate_system_prompt(*system_prompt);
     const auto inline_reference = detail::select_inline_reference(request, effective, encode_only);
@@ -175,7 +183,10 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     if (const auto ordered = runtime::find_option(effective.options, {"multi_reference_cond", "references"})) {
         const auto descriptors = parse_conditioning_json(*ordered);
         if (!descriptors.is_array()) throw runtime::InvalidRequestError("Drama 3 references must be a JSON array");
-        for (const auto & value : descriptors.as_array()) references.push_back(conditioning_take(value));
+        for (const auto & value : descriptors.as_array()) {
+            if (inspect_only && !value.find("vq_codes")) throw runtime::InvalidRequestError("Prompt inspection requires compiled references");
+            references.push_back(conditioning_take(value));
+        }
     }
     if (task_.task == runtime::VoiceTaskKind::VoiceCloning && references.empty()) {
         throw runtime::InvalidRequestError("Drama 3 cloning requires at least one reference");
@@ -199,7 +210,9 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
             throw runtime::InvalidRequestError("Drama 3 continuation cannot consume acoustic tokens from another model family");
         }
         const std::string payload(reinterpret_cast<const char *>(artifact.payload.data()), artifact.payload.size());
-        history.push_back(conditioning_take(parse_conditioning_json(payload)));
+        const auto value = parse_conditioning_json(payload);
+        if (inspect_only && !value.find("vq_codes")) throw runtime::InvalidRequestError("Prompt inspection requires compiled history");
+        history.push_back(conditioning_take(value));
     }
     const auto takes = runtime::find_option(effective.options, {"previous_takes"});
     const auto takes_file = runtime::find_option(effective.options, {"previous_takes_file"});
@@ -207,6 +220,9 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     if (takes || takes_file) {
         const auto descriptors = parse_conditioning_json(takes_file ? engine::io::read_text_file(*takes_file) : *takes);
         const auto append_take = [&](const json::Value & value) {
+            if (inspect_only && (value.is_string() || !value.find("vq_codes"))) {
+                throw runtime::InvalidRequestError("Prompt inspection requires compiled history");
+            }
             if (value.is_string()) {
                 auto generated = generator_->generate(value.as_string(), references, history, sampling, false, {}, false, system_prompt);
                 history.push_back({value.as_string(), std::move(generated.codes)});
@@ -218,14 +234,27 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
             append_take(descriptors);
         }
     }
-    const int64_t chunk_size = runtime::parse_positive_i64_option(effective.options, {"text_chunk_size"}, 128);
-    const auto mode = engine::text::parse_text_chunk_mode_override(effective.options).value_or(engine::text::TextChunkMode::TagAware);
-    const auto chunks = runtime::chunk_text_request(effective, chunk_size, mode);
+    const auto chunks = detail::text_units(effective);
+    if (inspect_only) {
+        const auto positions = generator_->prompt_positions(effective.text_input->text, references, history, system_prompt);
+        runtime::TaskResult inspected;
+        inspected.custom_schema_output = runtime::CustomSchemaOutput{"drama3_prompt_v1", json::Value::make_object({
+            {"single_unit_capability", json::Value::make_string("drama3.single-utterance.v1")},
+            {"generation_units", json::Value::make_number(1)},
+            {"input_text", json::Value::make_string(effective.text_input->text)},
+            {"prompt_positions", json::Value::make_number(static_cast<double>(positions))},
+            {"context_positions", json::Value::make_number(generator_->context_positions())},
+            {"max_output_frames", json::Value::make_number(sampling.max_frames)},
+            {"fits", json::Value::make_bool(sampling.max_frames <= generator_->context_positions() &&
+                positions <= static_cast<size_t>(generator_->context_positions() - sampling.max_frames))}})};
+        return inspected;
+    }
     runtime::TaskResult result;
     runtime::AudioBuffer merged;
     std::vector<Drama3Take> generated_takes;
     const auto started = std::chrono::steady_clock::now();
     bool limited = false;
+    json::Value::Array prompt_counts;
     for (size_t index = 0; index < chunks.size(); ++index) {
         auto chunk_sampling = sampling;
         chunk_sampling.seed += static_cast<uint32_t>(index);
@@ -240,6 +269,8 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
             };
         }
         const auto & text = chunks[index].text_input->text;
+        prompt_counts.push_back(json::Value::make_number(static_cast<double>(
+            generator_->prompt_positions(text, references, context, system_prompt))));
         auto generated = generator_->generate(text, references, context, chunk_sampling, streaming, callback, index > 0, system_prompt);
         runtime::append_audio_buffer(merged, generated.audio);
         limited = limited || generated.reached_limit;
@@ -253,6 +284,12 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     engine::debug::timing_log_scalar("session.wall_ms", wall_ms);
     result.custom_schema_output = runtime::CustomSchemaOutput{"drama3_generation_v1", json::Value::make_object({
         {"frames", json::Value::make_number(take.codes.frames)},
+        {"generation_units", json::Value::make_number(static_cast<double>(chunks.size()))},
+        {"single_unit_capability", json::Value::make_string(detail::single_text_unit(effective) ? "drama3.single-utterance.v1" : "")},
+        {"input_text", json::Value::make_string(effective.text_input->text)},
+        {"prompt_positions", json::Value::make_array(std::move(prompt_counts))},
+        {"context_positions", json::Value::make_number(generator_->context_positions())},
+        {"max_output_frames", json::Value::make_number(sampling.max_frames)},
         {"reached_limit", json::Value::make_bool(limited)},
         {"wall_ms", json::Value::make_number(wall_ms)}})};
     return result;

@@ -426,3 +426,25 @@ offload placement can change floating-point results and the sampled take.
 The weights are subject to the Fish Audio Community License. See the model
 repository's [LICENSE](https://huggingface.co/Jmica/Drama-3-GGUF/blob/main/LICENSE)
 and [NOTICE](https://huggingface.co/Jmica/Drama-3-GGUF/blob/main/NOTICE).
+# Whole utterances and prompt inspection
+
+The task API accepts `request.options.text_chunk_mode="none"` to run the exact
+provided text as one unit, including its leading/trailing whitespace. It cannot
+be combined with `text_chunk_size`. Existing chunking defaults are unchanged.
+The generation metadata reports `generation_units`, `single_unit_capability`
+(`drama3.single-utterance.v1` for this mode), exact `input_text`, each unit's
+`prompt_positions`, configured `context_positions` and `max_output_frames`.
+The take artifact retains the corresponding original text and acoustic codes.
+
+With this mode, `request.options.inspect_prompt_only=true` returns the custom
+schema `drama3_prompt_v1` without running generation. Provide references and
+history as code descriptors; inspection rejects audio inputs and string-only
+history (which would otherwise generate speech). Its tokenizer and serializer
+are the same ones used by inference. `prompt_positions + max_output_frames`
+must fit `context_positions`; `fits` reports this result. Compilation avoids
+encoding work but does not remove acoustic frames from that prompt budget.
+
+Windows maintainers can run `scripts/ci_drama3.ps1` from a Visual Studio developer
+shell against an existing configured build. It builds the server and selected
+CPU tests, runs CTest and writes a compact source/binary receipt. It performs no
+model acquisition or GPU inference; runtime qualification is a separate step.
