@@ -376,6 +376,7 @@ int main() {
             engine::debug::reset_logging();
             std::ifstream input(log);
             const std::string content{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+            input.close();
             std::filesystem::remove(log);
             if (content.find("SENSITIVE_") != std::string::npos || content.find("ORDINARY_SERIAL") == std::string::npos ||
                 content.find("ORDINARY_WRONG_ROUTE") == std::string::npos ||
